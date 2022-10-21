@@ -44,11 +44,16 @@ def eprint(*args, **kwargs):
     print(*args, **kwargs, file = sys.stderr)
 
 
-def statedict_prune(state_dict, print_stats: bool = True):
+def statedict_half(state_dict, print_stats: bool = True):
     halfed_cnt = 0
     halfed_bytes = 0
+    total_bytes = 0
 
     for key, val in list(state_dict.items()):
+        if not isinstance(val, torch.Tensor):
+            continue
+
+        total_bytes += val.element_size() * val.nelement()
         if val.dtype is torch.float32:  # avoid converting any ints to f16
             halfed = val.half()
             state_dict[key] = halfed
@@ -58,7 +63,7 @@ def statedict_prune(state_dict, print_stats: bool = True):
     if print_stats:
         print(f"pruned {halfed_cnt} keys, {halfed_bytes} bytes, {halfed_bytes / 1024 ** 3:.2f} GB!")
 
-    return (halfed_cnt, halfed_bytes)
+    return (halfed_cnt, halfed_bytes, total_bytes)
 
 
 class IGNORED_REDUCE():
@@ -72,10 +77,24 @@ class IGNORED_REDUCE():
         return f"IGNORED_REDUCE({self.ignored_name!r})"
 
 
+def skip_setitem_kv(extended: bool, key, val):
+    if isinstance(key, str):
+        if key.startswith("__"):
+            eprint(f"SETITEMS ignoring __ keyval {key!r}: {val!r}")
+            return True
+        return False
+
+    if extended and isinstance(key, int):
+        return False
+
+    raise ValueError("unsupported key", key)
+
+
 def bytes_safe_load_dict(
         pickle_bytes: bytes, persistent_id_load_fn,
         reduce_fns_custom = None,
         reduce_fns_ignore_unknown = False,
+        extended: bool = True,
 ):
     reduce_fns = {
         **{ 'collections OrderedDict': collections.OrderedDict },
@@ -160,10 +179,13 @@ def bytes_safe_load_dict(
             stack.append(False)
             continue
 
-        if opcode.name == "BUILD":
+        if extended and opcode.name == "BUILD":
             build_arg = stack.pop()
             last = stack[-1]
-            eprint(f"ignoring BUILD of object {last!r} with args {build_arg!r}")
+            if isinstance(last, dict) and isinstance(build_arg, dict):
+                last.update(build_arg)
+            else:
+                eprint(f"ignoring BUILD of object {last!r} with args {build_arg!r}")
             continue
 
         if opcode.name == "TUPLE":
@@ -171,15 +193,26 @@ def bytes_safe_load_dict(
             stack.append(tup)
             continue
 
+        if extended and opcode.name == "APPENDS":
+            values = stack_pop_until(markobject)
+            target = stack[-1]
+            if not isinstance(target, list):
+                raise ValueError("expected list", type(target), target)
+            target.extend(values)
+            continue
+
         if opcode.name == "SETITEM":
             val = stack.pop()
             key = stack.pop()
 
-            if key.startswith("__"):
-                eprint(f"SETITEMS ignoring __ keyval {key!r}: {val!r}")
+            target = stack[-1]
+            if not isinstance(target, dict):
+                raise ValueError("expected settitems dict", type(target), target)
+
+            if skip_setitem_kv(extended, key, val):
                 continue
 
-            stack[-1][key] = val
+            target[key] = val
             continue
 
         if opcode.name == "SETITEMS":
@@ -190,13 +223,15 @@ def bytes_safe_load_dict(
             items = [(items[i], items[i + 1]) for i in range(0, len(items), 2)]
             map = dict(items)
             use_map = { }
-            for k, v in map.items():
-                if k.startswith("__"):
-                    eprint(f"SETITEMS ignoring __ keyval {k!r}: {v!r}")
+            for key, val in map.items():
+                if skip_setitem_kv(extended, key, val):
                     continue
-                use_map[k] = v
+                use_map[key] = val
 
-            stack[-1].update(use_map)
+            target = stack[-1]
+            if not isinstance(target, dict):
+                raise ValueError("expected settitems dict", type(target), target)
+            target.update(use_map)
             continue
 
         if opcode.name == "TUPLE1":
@@ -227,7 +262,8 @@ def bytes_safe_load_dict(
             "BINUNICODE",
             "BININT1", "BININT2", "BININT", "LONG", "LONG1", "LONG4",
             "BINFLOAT",
-            "GLOBAL" }:
+            "GLOBAL",
+        }:
             # print(f"OPT {opcode.name!r} pushing {arg !r}")
             stack.append(arg)
             continue
@@ -244,7 +280,7 @@ def bytes_safe_load_dict(
     return last
 
 
-def torch_safe_load_dict(model_path_or_zipfile: Union[str, zipfile.ZipFile]):
+def torch_safe_load_dict(model_path_or_zipfile: Union[str, zipfile.ZipFile], extended: bool = False):
     if isinstance(model_path_or_zipfile, str):
         model_path_or_zipfile = zipfile.ZipFile(model_path_or_zipfile)
 
@@ -285,22 +321,23 @@ def torch_safe_load_dict(model_path_or_zipfile: Union[str, zipfile.ZipFile]):
             "torch._utils _rebuild_tensor_v2": build_tensor,
         },
         reduce_fns_ignore_unknown = True,
+        extended = extended,
     )
 
     return model
 
 
-def main(input_path: str, output_path: str, overwrite: bool, half: bool):
+def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool):
     if not overwrite and os.path.exists(output_path):
         raise ValueError(f"output_file path exists already, overwriting disabled {output_path!r}")
 
     print(f"loading {input_path!r}")
-    model = torch_safe_load_dict(input_path)
+    model = torch_safe_load_dict(input_path, extended)
     sd = model["state_dict"]
 
     if half:
-        print("pruning")
-        statedict_prune(sd, True)
+        print("halfing")
+        statedict_half(sd, True)
 
     model = { "state_dict": sd }
 
@@ -316,10 +353,11 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser()
         parser.add_argument("input_file")
         parser.add_argument("output_file")
+        parser.add_argument("-e", "--extended", action = "store_true")
         parser.add_argument("-o", "--overwrite", action = "store_true")
-        parser.add_argument("-p", "--prune", action = "store_true")
+        parser.add_argument("-H", "--half", action = "store_true")
         args = parser.parse_args()
-        main(args.input_file, args.output_file, args.overwrite, args.prune)
+        main(args.input_file, args.output_file, args.overwrite, args.half, args.extended)
 
 
     setup()

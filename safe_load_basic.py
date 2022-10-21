@@ -1189,7 +1189,7 @@ for i in SD_KEYS:
     del i
 
 
-def statedict_prune(state_dict, print_stats: bool = True):
+def statedict_half(state_dict, print_stats: bool = True):
     halfed_cnt = 0
     halfed_bytes = 0
 
@@ -1307,8 +1307,8 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, forbid_
         sd = save_load_statedict(zip, forbid_other_keys)
 
     if half:
-        print("pruning")
-        statedict_prune(sd, True)
+        print("halfing")
+        statedict_half(sd, True)
 
     model = { "state_dict": sd }
 
@@ -1323,10 +1323,10 @@ if __name__ == "__main__":
         parser.add_argument("input_file")
         parser.add_argument("output_file")
         parser.add_argument("-o", "--overwrite", action = "store_true")
-        parser.add_argument("-p", "--prune", action = "store_true")
+        parser.add_argument("-H", "--half", action = "store_true")
         parser.add_argument("-f", "--forbid_other_keys", action = "store_true")
         args = parser.parse_args()
-        main(args.input_file, args.output_file, args.overwrite, args.prune, False)
+        main(args.input_file, args.output_file, args.overwrite, args.half, False)
 
 
     setup()
