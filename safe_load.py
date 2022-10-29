@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+#
 # Copyright (c) 2022 RatWithAShotgun
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -27,10 +27,9 @@
 # Skips everything else.
 
 # dependencies: torch
-# usage: python safe_load.py [--prune] [--overwrite] path_to_input.ckpt  path_where_to_save.ckpt
+# usage: python safe_load.py [--half] [--overwrite] path_to_input.ckpt  path_where_to_save.ckpt
 
 import os.path
-import sys
 import argparse
 import collections
 import zipfile
@@ -39,12 +38,12 @@ from typing import Union
 import torch
 import pickletools
 
+import logging as _logging
 
-def eprint(*args, **kwargs):
-    print(*args, **kwargs, file = sys.stderr)
+logger = _logging.getLogger(__name__)
 
 
-def statedict_half(state_dict, print_stats: bool = True):
+def statedict_half(state_dict, print_stats: bool = False):
     halfed_cnt = 0
     halfed_bytes = 0
     total_bytes = 0
@@ -61,7 +60,7 @@ def statedict_half(state_dict, print_stats: bool = True):
             halfed_bytes += halfed.element_size() * halfed.nelement()
 
     if print_stats:
-        print(f"pruned {halfed_cnt} keys, {halfed_bytes} bytes, {halfed_bytes / 1024 ** 3:.2f} GB!")
+        print(f"halfed {halfed_cnt} keys, {halfed_bytes} bytes, {halfed_bytes / 1024 ** 3:.2f} GB!")
 
     return (halfed_cnt, halfed_bytes, total_bytes)
 
@@ -77,20 +76,20 @@ class IGNORED_REDUCE():
         return f"IGNORED_REDUCE({self.ignored_name!r})"
 
 
-def skip_setitem_kv(extended: bool, key, val):
+def _skip_kv(allow_int_keys: bool, key, val, label: str):
     if isinstance(key, str):
         if key.startswith("__"):
-            eprint(f"SETITEMS ignoring __ keyval {key!r}: {val!r}")
+            logger.info("%s ignoring __ keyval %r: %r", label, key, val)
             return True
         return False
 
-    if extended and isinstance(key, int):
+    if allow_int_keys and isinstance(key, int):
         return False
 
-    raise ValueError("unsupported key", key)
+    raise ValueError("unsupported key", label, key)
 
 
-def bytes_safe_load_dict(
+def pickle_bytes_safe_load_dict(
         pickle_bytes: bytes, persistent_id_load_fn,
         reduce_fns_custom = None,
         reduce_fns_ignore_unknown = False,
@@ -100,8 +99,6 @@ def bytes_safe_load_dict(
         **{ 'collections OrderedDict': collections.OrderedDict },
         **(reduce_fns_custom or { }),
     }
-    # print("reduce_fns", reduce_fns)
-
     stack = []
     memo = { }
 
@@ -135,7 +132,7 @@ def bytes_safe_load_dict(
             memo[arg] = stack[-1]
             continue
 
-        elif opcode.name in ("GET", "BINGET", "LONG_BINGET"):
+        elif opcode.name in { "GET", "BINGET", "LONG_BINGET" }:
             stack.append(memo[arg])
             continue
 
@@ -145,7 +142,7 @@ def bytes_safe_load_dict(
             func = reduce_fns.get(func_name)
             if func is None:
                 if reduce_fns_ignore_unknown:
-                    eprint(f"ignoring unkonwn reduce function {func_name!r} with args {arg_tup!r}")
+                    logger.info("ignoring unkonwn reduce function %r with args %r", func_name, arg_tup)
                     stack.append(IGNORED_REDUCE(str(func_name)))
                     continue
                 raise ValueError("unsupported reduce function", repr(func_name), arg_tup)
@@ -183,9 +180,10 @@ def bytes_safe_load_dict(
             build_arg = stack.pop()
             last = stack[-1]
             if isinstance(last, dict) and isinstance(build_arg, dict):
+                build_arg = { key: val for (key, val) in build_arg.items() if not _skip_kv(extended, key, val, "BUILD") }
                 last.update(build_arg)
             else:
-                eprint(f"ignoring BUILD of object {last!r} with args {build_arg!r}")
+                logger.info("ignoring BUILD of object %r with args %r", last, build_arg)
             continue
 
         if opcode.name == "TUPLE":
@@ -193,7 +191,7 @@ def bytes_safe_load_dict(
             stack.append(tup)
             continue
 
-        if extended and opcode.name == "APPENDS":
+        if opcode.name == "APPENDS":
             values = stack_pop_until(markobject)
             target = stack[-1]
             if not isinstance(target, list):
@@ -209,10 +207,8 @@ def bytes_safe_load_dict(
             if not isinstance(target, dict):
                 raise ValueError("expected settitems dict", type(target), target)
 
-            if skip_setitem_kv(extended, key, val):
-                continue
-
-            target[key] = val
+            if not _skip_kv(extended, key, val, "SETITEM"):
+                target[key] = val
             continue
 
         if opcode.name == "SETITEMS":
@@ -221,17 +217,14 @@ def bytes_safe_load_dict(
                 raise ValueError("uneven SETITEMS key number", len(items), items)
 
             items = [(items[i], items[i + 1]) for i in range(0, len(items), 2)]
-            map = dict(items)
-            use_map = { }
-            for key, val in map.items():
-                if skip_setitem_kv(extended, key, val):
-                    continue
-                use_map[key] = val
+            set_map = dict(items)
+            set_map = { key: val for (key, val) in set_map.items() if not _skip_kv(extended, key, val, "SETITEMS") }
 
             target = stack[-1]
             if not isinstance(target, dict):
                 raise ValueError("expected settitems dict", type(target), target)
-            target.update(use_map)
+
+            target.update(set_map)
             continue
 
         if opcode.name == "TUPLE1":
@@ -315,7 +308,7 @@ def torch_safe_load_dict(model_path_or_zipfile: Union[str, zipfile.ZipFile], ext
         tensor = torch.frombuffer(data, dtype = dtype, requires_grad = requires_grad)
         return tensor.set_(tensor, storage_offset = 0, size = torch.Size(size), stride = stride)
 
-    model = bytes_safe_load_dict(
+    model = pickle_bytes_safe_load_dict(
         data_pickle_bytes, persistent_id_load_fn,
         reduce_fns_custom = {
             "torch._utils _rebuild_tensor_v2": build_tensor,
@@ -353,11 +346,12 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser()
         parser.add_argument("input_file")
         parser.add_argument("output_file")
-        parser.add_argument("-e", "--extended", action = "store_true")
+        parser.add_argument("-s", "--simple", action = "store_true", help = "no BUILD, int keys")
         parser.add_argument("-o", "--overwrite", action = "store_true")
         parser.add_argument("-H", "--half", action = "store_true")
         args = parser.parse_args()
-        main(args.input_file, args.output_file, args.overwrite, args.half, args.extended)
+        _logging.basicConfig(level = _logging.DEBUG)
+        main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple)
 
 
     setup()
