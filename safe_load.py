@@ -22,7 +22,7 @@
 
 
 # Uses pickletools and minimal implementation of pickling opcode processing to read torch pickled weights.
-# Supports nothing expect basic python types (int, float, list, tuple, dicts; arbitrarily nested)
+# Supports nothing expect basic python types (int, float, str, list, tuple, dicts; arbitrarily nested)
 # and loading torch saved basic tensors.
 # Skips everything else.
 
@@ -63,6 +63,58 @@ def statedict_half(state_dict, print_stats: bool = False):
         print(f"halfed {halfed_cnt} keys, {halfed_bytes} bytes, {halfed_bytes / 1024 ** 3:.2f} GB!")
 
     return (halfed_cnt, halfed_bytes, total_bytes)
+
+
+def statedict_convert_ema(sd: dict, optional: bool, print_stats: bool = False, verbose: bool = False):
+    update = { }
+    stripped = { }
+    missing = set()
+    for key, val in sd.items():
+        if key.startswith("model."):
+            # replace each "model." key with the equivalent "model_ema." key
+            ema_key = "model_ema." + key[6:].replace(".", "")
+            try:
+                update[key] = sd[ema_key]
+                stripped[ema_key] = val
+            except KeyError:
+                if not optional:
+                    raise
+                missing.add(key)
+
+    ema_keys = { i for i in sd.keys() if i.startswith("model_ema.") }
+    ema_keys_kept = ema_keys - stripped.keys()
+
+    for key in stripped:
+        del sd[key]
+
+    sd.update(update)
+
+    if print_stats:
+        verbose_str = ""
+        if verbose:
+            verbose_str = f"stripped: {sorted(stripped.keys())}, missed: {sorted(missing)}, kept: {sorted(ema_keys_kept)}."
+
+        print(
+            f"replaced {len(update)} model with ema keys. "
+            f"ema keys: {len(missing)} missing, {len(ema_keys_kept)} non model kept. {verbose_str}"
+        )
+
+    return sd, stripped
+
+
+def statedict_strip_ema(sd: dict, print_stats: bool = False):
+    stripped = { }
+    for key, val in sd.items():
+        if key.startswith("model_ema."):
+            stripped[key] = val
+
+    for key in stripped:
+        del sd[key]
+
+    if print_stats:
+        print(f"stripped {len(stripped)} ema model keys from state_dict: {sorted(stripped.keys())}")
+
+    return sd, stripped
 
 
 class IGNORED_REDUCE():
@@ -320,7 +372,9 @@ def torch_safe_load_dict(model_path_or_zipfile: Union[str, zipfile.ZipFile], ext
     return model
 
 
-def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool):
+def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool,
+         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
+         set_times: bool, use_tmpfile: bool):
     if not overwrite and os.path.exists(output_path):
         raise ValueError(f"output_file path exists already, overwriting disabled {output_path!r}")
 
@@ -332,11 +386,41 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
         print("halfing")
         statedict_half(sd, True)
 
+    if ema_rename_require:
+        print("replacing model keys with required ema model keys")
+        statedict_convert_ema(sd, False, print_stats = True)
+    elif ema_rename_optional:
+        print("replacing model keys with ema model keys if present")
+        statedict_convert_ema(sd, True, print_stats = True)
+
+    if ema_strip:
+        print("stripping ema model keys")
+        statedict_strip_ema(sd, True)
+
     model = { "state_dict": sd }
 
-    print(f"writing to {output_path!r}, overwrite={overwrite}")
-    with open(output_path, "wb" if overwrite else "xb") as out_file:
+    if use_tmpfile:
+        write_path = f"{output_path}.tmp"
+        mode = "wb"
+        print(f"writing to tmp file {write_path!r}")
+    else:
+        write_path = output_path
+        mode = "wb" if overwrite else "xb"
+        print(f"writing to {output_path!r}, overwrite={overwrite}")
+
+    with open(write_path, mode) as out_file:
         torch.save(model, out_file)
+
+    if use_tmpfile:
+        if not overwrite and os.path.exists(output_path):
+            raise ValueError(f"output_file path exists, didn't before, overwriting disabled {output_path!r}")
+        assert write_path != output_path
+        os.rename(write_path, output_path)
+
+    if set_times:
+        cur = os.stat(input_path)
+        print(f"setting access/modified times of {input_path!r} on {output_path!r}", (cur.st_atime_ns, cur.st_mtime_ns))
+        os.utime(output_path, ns = (cur.st_atime_ns, cur.st_mtime_ns))
 
     print("done")
 
@@ -349,9 +433,19 @@ if __name__ == "__main__":
         parser.add_argument("-s", "--simple", action = "store_true", help = "no BUILD, int keys")
         parser.add_argument("-o", "--overwrite", action = "store_true")
         parser.add_argument("-H", "--half", action = "store_true")
+
+        parser.add_argument("-e", "--ema-rename-try", action = "store_true", help = "if ema keys present replace normal model keys with ema equivalent, ema keys not kept separately")
+        parser.add_argument("--ema-rename", action = "store_true", help = "replace normal model keys with ema equivalent, ema keys not kept separately, require ema keys")
+        parser.add_argument("-E", "--ema-strip", action = "store_true", help = "strip ema model keys")
+        parser.add_argument("-t", "--times", action = "store_true", help = "set same access/modified time on output file as on input file")
+
+        parser.add_argument("-T", "--no-tempfile", action = "store_true", help = "write to output file directly, don't use tempfile and rename")
+
+        # parser.add_argument("-S", "--strip", choices = ["ema", "non_ema"])
         args = parser.parse_args()
         _logging.basicConfig(level = _logging.DEBUG)
-        main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple)
+        main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple, args.ema_rename, args.ema_rename_try, args.ema_strip,
+             args.times, not args.no_tempfile)
 
 
     setup()
