@@ -19,8 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-
+#
+#
 # Uses pickletools and minimal implementation of pickling opcode processing to read torch pickled weights.
 # Supports nothing expect basic python types (int, float, str, list, tuple, dicts; arbitrarily nested)
 # and loading torch saved basic tensors.
@@ -33,6 +33,7 @@ import os.path
 import argparse
 import collections
 import zipfile
+import functools
 from typing import Union
 
 import torch
@@ -325,41 +326,45 @@ def pickle_bytes_safe_load_dict(
     return last
 
 
+DTYPE_MAP = {
+    "torch FloatStorage": (torch.float32, 4),
+    "torch HalfStorage":  (torch.float16, 2),
+    "torch IntStorage":   (torch.int32, 4),
+    "torch LongStorage":  (torch.int64, 8),
+}
+
+
+def _build_tensor(zipfile, storage, storage_offset, size, stride, requires_grad, backward_hooks):
+    if storage_offset or backward_hooks:
+        raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride, backward_hooks))
+
+    (storage, dtype_str, index, location, element_count) = storage
+    if storage != "storage":
+        raise ValueError("expected storage", storage)
+
+    dtype, dtype_size = DTYPE_MAP[dtype_str]
+    data_path = f"archive/data/{index}"
+    data = zipfile.read(data_path)
+
+    expected_size = element_count * dtype_size
+    if len(data) != expected_size:
+        raise ValueError("read unexpected amount of bytes",
+                         len(data), expected_size, data_path, element_count, dtype_size)
+
+    tensor = torch.frombuffer(data, dtype = dtype, requires_grad = requires_grad)
+    return tensor.set_(tensor, storage_offset = 0, size = torch.Size(size), stride = stride)
+
+
 def torch_safe_load_dict(model_path_or_zipfile: Union[str, zipfile.ZipFile], extended: bool = False):
     if isinstance(model_path_or_zipfile, str):
         model_path_or_zipfile = zipfile.ZipFile(model_path_or_zipfile)
-
-    DTYPE_MAP = {
-        "torch FloatStorage": (torch.float32, 4),
-        "torch HalfStorage":  (torch.float16, 2),
-        "torch IntStorage":   (torch.int32, 4),
-        "torch LongStorage":  (torch.int64, 8),
-    }
 
     data_pickle_bytes = model_path_or_zipfile.read("archive/data.pkl")
 
     def persistent_id_load_fn(arg):
         return arg
 
-    def build_tensor(storage, storage_offset, size, stride, requires_grad, backward_hooks):
-        if storage_offset or backward_hooks:
-            raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride, backward_hooks))
-
-        (storage, dtype_str, index, location, element_count) = storage
-        assert storage == "storage"
-
-        dtype, dtype_size = DTYPE_MAP[dtype_str]
-        data_path = f"archive/data/{index}"
-        data = model_path_or_zipfile.read(data_path)
-
-        expected_size = element_count * dtype_size
-        if len(data) != expected_size:
-            raise ValueError("read unexpected amount of bytes",
-                             len(data), expected_size, data_path, element_count, dtype_size)
-
-        tensor = torch.frombuffer(data, dtype = dtype, requires_grad = requires_grad)
-        return tensor.set_(tensor, storage_offset = 0, size = torch.Size(size), stride = stride)
-
+    build_tensor = functools.partial(_build_tensor, model_path_or_zipfile)
     model = pickle_bytes_safe_load_dict(
         data_pickle_bytes, persistent_id_load_fn,
         reduce_fns_custom = {
