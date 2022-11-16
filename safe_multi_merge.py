@@ -30,6 +30,7 @@ import logging
 import logging as _logging
 import os
 import sys
+import time
 import zipfile
 from pathlib import Path
 from zipfile import ZipFile
@@ -183,7 +184,7 @@ def merge_weighted(_ctx, tensors: List[torch.Tensor], factors: List[Union[int, f
     return base
 
 
-def _merge_use_first(ctx, vals: List[Any], factors):
+def _merge_use_first(_ctx, vals: List[Any], _configs):
     # print("_merge_use_first!!!", ctx, len(vals), str(vals).replace("\n","")[:100], factors)
     return vals[0]
 
@@ -191,9 +192,11 @@ def _merge_use_first(ctx, vals: List[Any], factors):
 def merge_tensors(
         model_merge_fn: Callable,
         text_merge_fn: Callable,
+        vae_merge_fn: Callable,
         fallback_merge_fn: Callable,
         key: str,
         configs: List,
+        inputs: List[Input],
         tensors: List[torch.Tensor],
         missing_inputs: List[Input],
         has_floats: bool, has_non_floats: bool,
@@ -204,12 +207,20 @@ def merge_tensors(
         if missing_inputs:
             raise ValueError("missing model tensors", missing_inputs)
         return model_merge_fn(None, tensors, configs)
+
     elif key.startswith("cond_stage_model."):
         if has_non_floats or not has_floats:
             raise ValueError("invalid text tensors", has_floats, has_non_floats, tensors)
         if missing_inputs:
             raise ValueError("missing text tensors", missing_inputs)
         return text_merge_fn(None, tensors, configs)
+
+    elif key.startswith("first_stage_model."):
+        if has_non_floats or not has_floats:
+            raise ValueError("invalid vae tensors", has_floats, has_non_floats, tensors)
+        if missing_inputs:
+            raise ValueError("missing vae tensors", missing_inputs)
+        return vae_merge_fn(None, tensors, configs)
 
     return fallback_merge_fn(None, tensors, configs)
 
@@ -248,15 +259,35 @@ def state_dicts_merge(
         only = set(only)
         all_keys = all_keys & only
 
+    expected_floats = { torch.float16, torch.float32 }
     if precision == "auto":
-        use_precision = None
+        longest_model_key = max([i for i in all_keys if i.startswith("model.")], key = lambda i: len(i))
+        lazy_tensors = []
+        for sd in state_dicts:
+            val = sd.get(longest_model_key)
+            if isinstance(val, LazyTensor):
+                lazy_tensors.append(val)
+
+        dtypes = { i.dtype() for i in lazy_tensors if i is not None }
+        has_floats = dtypes & expected_floats
+        non_floats = dtypes - expected_floats
+        if non_floats:
+            raise ValueError("got non floats for model keys, huh?", dtypes)
+
+        if len(has_floats) == 1:
+            use_precision = list(has_floats)[0]
+            logger.debug("using only seen precision: %s", use_precision)
+        else:
+            if has_floats != expected_floats:
+                raise ValueError("expected fp16 and fp32 here", dtypes)
+            use_precision = torch.float32
+            logger.debug("using best seen precision: %s", use_precision)
     else:
         use_precision = {
             "fp32": torch.float32,
             "fp16": torch.float16,
         }[precision]
 
-    expected_floats = { torch.float16, torch.float32 }
     merge_contexts = list(merge_contexts)
     new_sd_tups = [(i, { }) for i in merge_contexts]
     all_keys = sorted(all_keys)
@@ -275,7 +306,7 @@ def state_dicts_merge(
 
         if len(others) == len(lazy_tensors):
             for merge_ctx, new_sd in new_sd_tups:
-                new_sd[key] = merge_non_tensors_fn(key, merge_ctx, others)
+                new_sd[key] = merge_non_tensors_fn(key, others, merge_ctx)
             continue
 
         if require_all and None in lazy_tensors:
@@ -301,17 +332,6 @@ def state_dicts_merge(
         for pos, i in enumerate(lazy_tensors):
             tensors.append(i.load_copy() if i is not None else None)
 
-        if use_precision is None and has_floats:
-            # auto precision mode
-            if len(has_floats) == 1:
-                use_precision = list(has_floats)[0]
-                logger.debug("using only seen precision: %s", use_precision)
-            else:
-                if has_floats != expected_floats:
-                    raise ValueError("expected fp16 and fp32 here")
-                use_precision = torch.float32
-                logger.debug("using best seen precision: %s", use_precision)
-
         if has_floats:
             tensors = [i.to(use_precision) if i is not None else None for i in tensors]
 
@@ -320,29 +340,30 @@ def state_dicts_merge(
             raise ValueError("tensors of various sizes, can't merge", key, sizes)
 
         for merge_ctx, new_sd in new_sd_tups:
-            new_sd[key] = merge_tensors_fn(key, merge_ctx, tensors, bool(has_floats), is_mixed)
+            new_sd[key] = merge_tensors_fn(key, tensors, merge_ctx, bool(has_floats), is_mixed)
 
         del tensors
 
     return [new_sd for merge_ctx, new_sd in new_sd_tups]
 
 
-def _tensors_configs_filter(key: str, ctx: Output, inputs: List[Input], maybe_tensors: List[Optional[torch.Tensor]]):
+def _tensors_configs_filter(configs: List, inputs: List[Input], maybe_tensors: List[Optional[torch.Tensor]]):
     # filter out None tensors and return with list of corresponding configs
     assert len(maybe_tensors) == len(inputs)
-    assert len(maybe_tensors) == len(ctx.configs)
+    assert len(maybe_tensors) == len(configs)
 
-    combined = list(itertools.zip_longest(maybe_tensors, ctx.configs, inputs))
+    combined = list(itertools.zip_longest(maybe_tensors, configs, inputs))
     # filter out ones without tensor of that key in input or with config set to skip
-    with_tensor = [(t, c) for (t, c, i) in combined if t is not None and c is not SKIP_INPUT]
+    with_tensor = [(t, c, i) for (t, c, i) in combined if t is not None and c is not SKIP_INPUT]
     missing_key = [i for (t, c, i) in combined if t is None and c is not SKIP_INPUT]
 
     if not with_tensor:
         raise ValueError("no tensors", maybe_tensors, with_tensor)
 
-    tensors = [t for (t, c) in with_tensor]
-    configs = [c for (t, c) in with_tensor]
-    return tensors, configs, missing_key
+    inputs = [i for (t, c, i) in with_tensor]
+    tensors = [t for (t, c, i) in with_tensor]
+    configs = [c for (t, c, i) in with_tensor]
+    return inputs, tensors, configs, missing_key
 
 
 def _to_inputs(inputs: List[Union[Input, str]]) -> List[Input]:
@@ -405,6 +426,15 @@ def _all_equal(tensors: Iterable[torch.Tensor]):
     return e1
 
 
+def _single_tensor_check(tensors: List[torch.Tensor], skip_equal: bool, key = None) -> Optional[torch.Tensor]:
+    if len(tensors) == 1:
+        return torch.clone(tensors[0])
+    elif skip_equal and _all_equal(tensors):
+        logging.debug("skipping merging %s all equal tensors: %r", len(tensors), key)
+        return torch.clone(tensors[0])
+    return None
+
+
 def inputs_outputs_merge_in_memory(
         inputs: List[Union[Input, str]],
         configs_outputs: List[Union[Any, Output]],
@@ -416,14 +446,11 @@ def inputs_outputs_merge_in_memory(
 ):
     inputs = _to_inputs(inputs)
 
-    def merge_tensors(key: str, ctx: Output, maybe_tensors: List[Optional[torch.Tensor]], has_floats: bool, is_mixed: bool):
-        tensors, configs, missing_inputs = _tensors_configs_filter(key, ctx, inputs, maybe_tensors)
-        if len(tensors) == 1:
-            return torch.clone(tensors[0])
-        elif skip_equal and _all_equal(tensors):
-            logging.debug("skipping merging %s all equal tensors: %r", len(tensors), key)
-            return torch.clone(tensors[0])
-        return merge_fn(key, configs, tensors, missing_inputs, has_floats, is_mixed)
+    def merge_tensors(key: str, maybe_tensors: List[Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
+        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs, inputs, maybe_tensors)
+        if tensor := _single_tensor_check(tensors, skip_equal, key):
+            return tensor
+        return merge_fn(key, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
 
     sds = [i.state_dict() for i in inputs]
     outputs = [(i if isinstance(i, Output) else Output(None, i)) for i in configs_outputs]
@@ -516,18 +543,13 @@ def inputs_outputs_merge_torch_zip_stream(
     inputs = _to_inputs(inputs)
     output_writers = { id(i): _OutputWriter(i) for i in outputs }
 
-    def merge_tensors(key: str, ctx: Output, maybe_tensors: List[Optional[torch.Tensor]], has_floats: bool, is_mixed: bool):
+    def merge_tensors(key: str, maybe_tensors: List[Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
         writer: _OutputWriter = output_writers[id(ctx)]
 
-        tensors, configs, missing_inputs = _tensors_configs_filter(key, ctx, inputs, maybe_tensors)
-        if len(tensors) == 1:
-            tensor = torch.clone(tensors[0])
-        elif skip_equal and _all_equal(tensors):
-            logging.debug("skipping merging %s all equal tensors: %r", len(tensors), key)
-            tensor = torch.clone(tensors[0])
-        else:
-            # print(f"diff {key!r:<100}", _all_equal_diff(tensors))
-            tensor = merge_fn(key, configs, tensors, missing_inputs, has_floats, is_mixed)
+        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs, inputs, maybe_tensors)
+        tensor = _single_tensor_check(tensors, skip_equal, key)
+        if tensor is None:
+            tensor = merge_fn(key, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
 
         # create fake classes that pickle serialize like torch.Tensor
         pers_id_tup = writer.persistent_id(tensor.storage())
@@ -571,6 +593,7 @@ def inputs_outputs_merge_torch_zip_stream(
         pickler.dump(model)
         data = io_buffer.getvalue()
         writer.output.zip_file.writestr("archive/data.pkl", data)
+        writer.output.zip_file.writestr("archive/version", "3\n")
 
 
 def ensure_unique(items, key = None, ignored_keys: Optional[Set] = None):
@@ -596,16 +619,20 @@ def _cleaned_name(name: str):
 
 def _make_output_path(
         inputs: List[Input], output: Output, output_dir: Optional[str],
+        merge_unet: Optional[bool] = None,
+        merge_text_encoder: Optional[bool] = None,
+        merge_vae_encoder: Optional[bool] = None,
         add_parent_dirnames: Optional[int] = None,
         prefix: Optional[str] = None,
         extension: Optional[str] = None,
+        relative_factors: bool = True,
 ):
     add_parent_dirnames = int(add_parent_dirnames or 0)
     if add_parent_dirnames < 0:
         raise ValueError("negative add_parent_dirnames", add_parent_dirnames)
 
     parts = []
-
+    factor_total = sum([i for i in output.configs if i is not SKIP_INPUT])
     for i, factor in itertools.zip_longest(inputs, output.configs):
         if factor is SKIP_INPUT:
             continue
@@ -618,14 +645,32 @@ def _make_output_path(
             path = Path(i.path)
             name = _cleaned_name(path.name)
             if add_parent_dirnames:
-                adding = [i.name for i in path.parents][-add_parent_dirnames:]
+                adding = list(reversed([i.name for i in path.parents]))[-add_parent_dirnames:]
                 name = "_".join(adding + [name])
 
-        p = f"{name}@{factor}"
+        if relative_factors:
+            rel_factor = factor / factor_total
+            use_factor = f"{rel_factor:.4f}".rstrip("0")
+        else:
+            use_factor = factor
+
+        p = f"{name}@{use_factor}"
         parts.append(p)
 
+    flags = []
+    if merge_unet:
+        flags.append("U")
+    if merge_text_encoder:
+        flags.append("T")
+    if merge_vae_encoder:
+        flags.append("V")
+
+    settings = ""
+    if flags:
+        settings = "@" + "".join(flags) + "_"
+
     full_name = "_+_".join(parts)
-    full_name = (prefix or "") + full_name
+    full_name = (prefix or "") + settings + full_name
     if extension:
         if not extension.startswith("."):
             extension = "." + extension
@@ -639,11 +684,15 @@ def _make_output_path(
 def main(
         inputs: List[Input], outputs: List[Output], output_dir: Optional[str],
         overwrite: bool, precision: str, extended: bool, add_parent_dirs: Optional[int],
-        name_prefix: Optional[str], extension: Optional[str],
+        name_prefix: Optional[str], extension: Optional[str], name_relative_factors: bool,
+        merge_unet: bool, merge_text_encoder: bool, merge_vae_encoder: bool,
         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
         set_times: bool, use_tmpfile: bool):
     if not inputs:
         raise ValueError("no inputs")
+
+    if not merge_unet and not merge_text_encoder and not merge_vae_encoder:
+        raise ValueError("disabled merging everything")
 
     ensure_unique(inputs, lambda i: i.ident, ignored_keys = { None })
     if not outputs:
@@ -653,24 +702,31 @@ def main(
         if not os.path.isdir(output_dir):
             raise ValueError("output dir not found or not a dir", output_dir)
 
-    merge_tensors_fn = functools.partial(merge_tensors, merge_weighted, _merge_use_first, _merge_use_first)
+    unet_fn = merge_weighted if merge_unet else _merge_use_first
+    text_fn = merge_weighted if merge_text_encoder else _merge_use_first
+    vae_fn = merge_weighted if merge_vae_encoder else _merge_use_first
+    merge_tensors_fn = functools.partial(merge_tensors, unet_fn, text_fn, vae_fn, _merge_use_first)
     # res = inputs_outputs_merge_in_memory(inputs, [i.configs for i in outputs], merge_tensors_fn, precision = precision)
 
     for i in outputs:
         # Check for already existing errors in its own first pass
         # to not create unnecessary empty output files in case of any errors.
-        output_path = i.path
-        if not overwrite and os.path.exists(output_path):
-            raise ValueError(f"output_file path exists already, overwriting disabled {output_path!r}")
-
-        if len(i.configs) != len(inputs):
-            raise ValueError(f"invalid number of output configs, expected {len(inputs)} like inputs but got {len(i.configs)}")
 
         if i.path is None:
             if output_dir is None:
                 raise ValueError("no name/path given for output and not output_dir, can't create name/path")
 
-            i.path = _make_output_path(inputs, i, output_dir, add_parent_dirs, name_prefix, extension)
+            i.path = _make_output_path(
+                inputs, i, output_dir,
+                merge_unet, merge_text_encoder, merge_vae_encoder,
+                add_parent_dirs, name_prefix, extension, name_relative_factors,
+            )
+
+        if not overwrite and os.path.exists(i.path):
+            raise ValueError(f"output_file path exists already, overwriting disabled {i.path!r}")
+
+        if len(i.configs) != len(inputs):
+            raise ValueError(f"invalid number of output configs, expected {len(inputs)} like inputs but got {len(i.configs)}")
 
     for i in inputs:
         i.open()
@@ -707,7 +763,11 @@ def main(
         print(f"opening merge output file {write_path!r}, factors: {i.configs}")
         i.open(mode)
 
+    start = time.monotonic()
     inputs_outputs_merge_torch_zip_stream(inputs, outputs, merge_tensors_fn, precision = precision)
+    end = time.monotonic()
+    diff = end - start
+    print(f"took {diff:.2f} secs ({diff / 60:.2f} mins)")
 
     for i in outputs:
         i.close()
@@ -774,19 +834,28 @@ if __name__ == "__main__":
         parser.add_argument("-s", "--simple", action = "store_true", help = "no BUILD, int keys")
         parser.add_argument("-o", "--overwrite", action = "store_true")
 
+        parser.add_argument("-T", "--merge-text-encoder", action = "store_true")
+        parser.add_argument("-V", "--merge-vae", action = "store_true")
+        parser.add_argument("-U", "--no-merge-unet", action = "store_true")
+        parser.add_argument("-f", "--full-factors-name", action = "store_true")
+
         parser.add_argument("-p", "--precision", choices = ["auto", "fp16", "fp32"], default = "auto",
                             help = '"auto" uses "fp32" if any of the tensors are fp32 otherwise uses "fp16"')
 
-        parser.add_argument("-e", "--ema-rename-try", action = "store_true", help = "if ema keys present replace normal model keys with ema equivalent, ema keys not kept separately")
-        parser.add_argument("--ema-rename", action = "store_true", help = "replace normal model keys with ema equivalent, ema keys not kept separately, require ema keys")
-        parser.add_argument("-E", "--ema-strip", action = "store_true", help = "strip ema model keys")
-        parser.add_argument("-t", "--times", action = "store_true", help = "set same access/modified time on output file as on input file")
+        parser.add_argument("-e", "--ema-rename-try", action = "store_true",
+                            help = "if ema keys present replace normal model keys with ema equivalent, ema keys not kept separately")
+        parser.add_argument("--ema-rename", action = "store_true",
+                            help = "replace normal model keys with ema equivalent, ema keys not kept separately, require ema keys")
+        parser.add_argument("-E", "--ema-strip", action = "store_true",
+                            help = "strip ema model keys")
+        parser.add_argument("-t", "--times", action = "store_true",
+                            help = "set same access/modified time on output file as on input file")
 
-        parser.add_argument("-T", "--no-tempfile", action = "store_true", help = "write to output file directly, don't use tempfile and rename")
+        parser.add_argument("-N", "--no-tempfile", action = "store_true", help = "write to output file directly, don't use tempfile and rename")
         parser.add_argument("--name-ext", default = "ckpt")
         parser.add_argument("--name-prefix", default = "merged_")
 
-        parser.add_argument("-n", "--add-parent-dirs", type = int,
+        parser.add_argument("-P", "--parent-dirs", type = int,
                             help = "add the names of up to [n] parent directories in front of each input name when generating output filename")
 
         sub_parsers = parser.add_subparsers(title = "merge type", required = True)
@@ -818,8 +887,9 @@ if __name__ == "__main__":
         # exit()
         main(
             inputs, outputs, output_dir,
-            args.overwrite, args.precision, not args.simple, args.add_parent_dirs,
-            args.name_prefix, args.name_ext,
+            args.overwrite, args.precision, not args.simple, args.parent_dirs,
+            args.name_prefix, args.name_ext, not args.full_factors_name,
+            not args.no_merge_unet, args.merge_text_encoder, args.merge_vae,
             args.ema_rename, args.ema_rename_try, args.ema_strip,
             args.times, not args.no_tempfile,
         )
