@@ -36,7 +36,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 if sys.version_info[:2] >= (3, 9):
-    from typing import Union, Optional, Any, TypeVar, List, Dict
+    from typing import Union, Optional, Any, TypeVar, List, Dict, Tuple
     from collections.abc import Iterable, Callable, Generator, AsyncGenerator, Collection, Set
 else:
     from typing import Dict, List, Tuple, Set, Union, Optional, Iterable, Type, Callable, Any, Generator, TypeVar
@@ -45,7 +45,7 @@ from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_
 
 import torch
 import merge_expression
-from merge_expression import Merge, Tens, Var, Minus
+from merge_expression import Merge, Tens, Var, Minus, merge_to_str
 
 logger = _logging.getLogger(__name__)
 IS_DEV = os.environ.get("DEV") == "1"
@@ -71,29 +71,36 @@ class Input():
 
 
 @dataclasses.dataclass()
-class BasicMergeFns():
-    model_merge_fn: Optional[Callable] = None
-    text_merge_fn: Optional[Callable] = None
-    vae_merge_fn: Optional[Callable] = None
-    fallback_merge_fn: Optional[Callable] = None
-
-
-@dataclasses.dataclass()
 class BasicMerge():
     factors: List[Union[int, float]]
-    ignore_missing_tensors: bool = False
-    fn: Optional[BasicMergeFns] = None
 
 
 @dataclasses.dataclass()
 class ExpressionMerge():
     merge: Merge
+    original_expression: Optional[str] = None
+
+
+Merger = Union[BasicMerge, ExpressionMerge, Callable]
+
+
+@dataclasses.dataclass()
+class MergeFn():
+    name: str
+    matcher: Callable[[str], bool]
+    merger: Merger
+
+
+@dataclasses.dataclass()
+class OutputArg():
+    path: Optional[str]
+    config: Tuple[str, Any]
 
 
 @dataclasses.dataclass()
 class Output():
     path: Optional[str]
-    config: Union[BasicMerge, ExpressionMerge]
+    mergers: List[MergeFn]
 
     write_path: Optional[str] = None
     zip_file: Optional[ZipFile] = None
@@ -116,9 +123,17 @@ class Output():
         self.zip_file.close()
         self.zip_file = None
 
-    def configs(self, inputs_cnt):
-        if isinstance(self.config, BasicMerge):
-            return self.config.factors
+    def key_merge(self, key) -> Merger:
+        for i in self.mergers:
+            if i.matcher(key):
+                return i.merger
+
+        raise ValueError("never got merger for key", key)
+
+    def configs(self, key: str, inputs_cnt):
+        merge = self.key_merge(key)
+        if isinstance(merge, BasicMerge):
+            return merge.factors
         else:
             return [None for _ in range(inputs_cnt)]
 
@@ -246,71 +261,42 @@ def _exp_run_minus(ctx: ParseCtx, minus: Minus):
 
 
 def _exp_run_merge(ctx: ParseCtx, merge: Merge):
-    factors_total = sum(i.factor for i in merge.items)
+    factor_total = merge.factor_total()
 
-    fact = merge.items[0].factor / factors_total
+    fact = merge.items[0].factor / factor_total
     base = _exp_get(ctx, merge.items[0].item) * fact
-    print("fact", fact)
     for i in merge.items[1:]:
         tens = _exp_get(ctx, i.item)
-        fact = i.factor / factors_total
-        print("fact", fact)
+        fact = i.factor / factor_total
         base += tens * fact
 
     return base
 
 
 def merge_tensors(
-        # ignore_missing_tensors: bool,
-        key: str,
-        ctx: Output,
-        configs: List,
-        inputs: List[Input],
-        tensors: List[torch.Tensor],
-        missing_inputs: List[Input],
-        has_floats: bool, has_non_floats: bool,
+        key: str, ctx: Output, configs: List, inputs: List[Input],
+        tensors: List[torch.Tensor], missing_inputs: List[Input], has_floats: bool, has_non_floats: bool,
 ) -> torch.Tensor:
-    if isinstance(ctx.config, BasicMerge):
-        return merge_tensors_weigthed(key, ctx.config, configs, tensors, missing_inputs, has_floats, has_non_floats)
-    if isinstance(ctx.config, ExpressionMerge):
+    merge = ctx.key_merge(key)
+
+    if isinstance(merge, ExpressionMerge):
         if len(tensors) != len(inputs):
             raise ValueError("huh", len(tensors), len(inputs))
         pctx = ParseCtx({ i.ident: t for (t, i) in zip(tensors, inputs) })
-        return _exp_run_merge(pctx, ctx.config.merge)
-    raise NotImplementedError("unsupported config type", ctx.config)
+        return _exp_run_merge(pctx, merge.merge)
 
+    if isinstance(merge, BasicMerge):
+        if has_non_floats or not has_floats:
+            raise ValueError(f"invalid tensors", key, has_floats, has_non_floats, tensors)
+        if missing_inputs:
+            raise _MissingTensorError(f"missing tensors", key, missing_inputs)
+        return merge_weighted(ctx, tensors, configs)
 
-def merge_tensors_weigthed(
-        key: str,
-        conf: BasicMerge,
-        factors: List[Union[int, float]],
-        tensors: List[torch.Tensor],
-        missing_inputs: List[Input],
-        has_floats: bool, has_non_floats: bool,
-) -> torch.Tensor:
-    if key.startswith("model."):
-        fn, label = conf.fn.model_merge_fn, "model"
-    elif key.startswith("cond_stage_model."):
-        fn, label = conf.fn.text_merge_fn, "text"
-    elif key.startswith("first_stage_model."):
-        fn, label = conf.fn.vae_merge_fn, "vae"
-    else:
-        fn, label = None, None
+    if callable(merge):
+        return merge(ctx, tensors, configs)
 
-    if fn is not None:
-        try:
-            if has_non_floats or not has_floats:
-                raise ValueError(f"invalid {label} tensors", key, has_floats, has_non_floats, tensors)
-            if missing_inputs:
-                raise _MissingTensorError(f"missing {label} tensors", key, missing_inputs)
-            return fn(None, tensors, factors)
-        except _MissingTensorError:
-            if not conf.ignore_missing_tensors:
-                raise
-            print(f"ignoring missing {label} tensor", key)
-
-    print("fallback merge", key, len(tensors))
-    return conf.fn.fallback_merge_fn(None, tensors, factors)
+    # return i.merger(key, ctx, configs, inputs, tensors, missing_inputs, has_floats, has_non_floats)
+    raise NotImplementedError("unsupported merge type", merge)
 
 
 def state_dicts_merge(
@@ -335,18 +321,11 @@ def state_dicts_merge(
 
     if IS_DEV:
         print("IS_DEV cutting only!!!")
-        only = [
-            'model.diffusion_model.input_blocks.8.0.out_layers.0.weight', 'model.diffusion_model.input_blocks.8.0.out_layers.3.bias', 'model.diffusion_model.input_blocks.8.0.out_layers.3.weight',
-            'model.diffusion_model.input_blocks.8.1.norm.bias', 'model.diffusion_model.input_blocks.8.1.norm.weight', 'model.diffusion_model.input_blocks.8.1.proj_in.bias',
-            'model.diffusion_model.input_blocks.8.1.proj_in.weight', 'model.diffusion_model.input_blocks.8.1.proj_out.bias', 'model.diffusion_model.input_blocks.8.1.proj_out.weight',
-            'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_k.weight', 'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_out.0.bias',
-            'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_out.0.weight', 'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_q.weight',
-            'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_v.weight', 'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_k.weight',
-            'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_out.0.bias', 'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_out.0.weight',
-            'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_q.weight', 'model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_v.weight'
-        ]
-        only = set(only)
-        all_keys = all_keys & only
+        # @formatter:off
+        only = []
+        all_keys = all_keys & set(only)
+        del only
+        # @formatter:on
 
     expected_floats = { torch.float16, torch.float32 }
     if precision == "auto":
@@ -547,19 +526,19 @@ def inputs_outputs_merge_in_memory(
         skip_equal: bool = True,
 ):
     inputs = _to_inputs(inputs)
+    ensure_unique(inputs, lambda i: i.ident, ignored_keys = { None })
 
     def merge_tensors(key: str, maybe_tensors: List[Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
-        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs, inputs, maybe_tensors)
-        if tensor := _single_tensor_check(tensors, skip_equal, key):
+        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs(len(inputs)), inputs, maybe_tensors)
+        if tensor := _single_tensor_check(tensors, skip_equal, key) is not None:
             return tensor
         return merge_fn(key, ctx, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
 
     sds = [i.state_dict() for i in inputs]
     outputs = [(i if isinstance(i, Output) else Output(None, i)) for i in configs_outputs]
-    unused_inputs = _never_used_inputs(outputs)
     new_sds = state_dicts_merge(
         sds, outputs, require_all, merge_tensors, merge_non_tensors,
-        precision = precision, never_load_inputs = unused_inputs,
+        precision = precision,
     )
     return new_sds
 
@@ -609,6 +588,8 @@ def inputs_outputs_merge_torch_zip_stream(
         merge_non_tensors = _merge_use_first,
         skip_equal: bool = True,
 ):
+    ensure_unique(inputs, lambda i: i.ident, ignored_keys = { None })
+
     import ctypes, pickle
     import torch._utils
 
@@ -629,8 +610,8 @@ def inputs_outputs_merge_torch_zip_stream(
     def merge_tensors(key: str, maybe_tensors: List[Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
         writer: _OutputWriter = output_writers[id(ctx)]
 
-        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs(len(inputs)), inputs, maybe_tensors)
-        tensor = None or _single_tensor_check(tensors, skip_equal, key)
+        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs(key, len(inputs)), inputs, maybe_tensors)
+        tensor = _single_tensor_check(tensors, skip_equal, key)
         if tensor is None:
             tensor = merge_fn(key, ctx, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
 
@@ -700,7 +681,7 @@ def _cleaned_name(name: str):
 
 
 def _make_output_path(
-        inputs: List[Input], output: Output, output_dir: Optional[str],
+        inputs: List[Input], output_arg: OutputArg, output_dir: Optional[str],
         merge_unet: Optional[bool] = None,
         merge_text_encoder: Optional[bool] = None,
         merge_vae_encoder: Optional[bool] = None,
@@ -713,31 +694,41 @@ def _make_output_path(
     if add_parent_dirnames < 0:
         raise ValueError("negative add_parent_dirnames", add_parent_dirnames)
 
-    parts = []
-    factor_total = sum([i for i in output.configs if i is not SKIP_INPUT])
-    for i, factor in itertools.zip_longest(inputs, output.configs):
-        if factor is SKIP_INPUT:
-            continue
+    if output_arg.config[0] == "basic":
+        basic: BasicMerge = output_arg.config[1]
+        parts = []
+        factor_total = sum([i for i in basic.factors if i is not SKIP_INPUT])
+        for i, factor in itertools.zip_longest(inputs, basic.factors):
+            if factor is SKIP_INPUT:
+                continue
 
-        i: Input
+            i: Input
 
-        if i.ident:
-            name = i.ident
-        else:
-            path = Path(i.path)
-            name = _cleaned_name(path.name)
-            if add_parent_dirnames:
-                adding = list(reversed([i.name for i in path.parents]))[-add_parent_dirnames:]
-                name = "_".join(adding + [name])
+            if i.ident:
+                name = i.ident
+            else:
+                path = Path(i.path)
+                name = _cleaned_name(path.name)
+                if add_parent_dirnames:
+                    adding = list(reversed([i.name for i in path.parents]))[-add_parent_dirnames:]
+                    name = "_".join(adding + [name])
 
-        if relative_factors:
-            rel_factor = factor / factor_total
-            use_factor = f"{rel_factor:.4f}".rstrip("0")
-        else:
-            use_factor = factor
+            if relative_factors:
+                rel_factor = factor / factor_total
+                use_factor = f"{rel_factor:.4f}".rstrip("0")
+            else:
+                use_factor = factor
 
-        p = f"{name}@{use_factor}"
-        parts.append(p)
+            p = f"{name}@{use_factor}"
+            parts.append(p)
+        full_name = "_+_".join(parts)
+    elif output_arg.config[0] == "expression":
+        full_name = merge_to_str(output_arg.config[1].merge)
+        # full_name = output_arg.config[1].original_expression
+        # print(full_name)
+        pass
+    else:
+        raise ValueError("unsupported output config", output_arg.config[0])
 
     flags = []
     if merge_unet:
@@ -751,7 +742,6 @@ def _make_output_path(
     if flags:
         settings = "@" + "".join(flags) + "_"
 
-    full_name = "_+_".join(parts)
     full_name = (prefix or "") + settings + full_name
     if extension:
         if not extension.startswith("."):
@@ -760,11 +750,40 @@ def _make_output_path(
 
     if output_dir:
         return os.path.join(output_dir, full_name)
+
+    print("full_name", full_name)
     return full_name
 
 
+def _config_merge_fns(merger, fallback, merge_unet: bool, merge_text_encoder: bool, merge_vae_encoder: bool, ):
+    configs = []
+
+    check = []
+    if merge_unet:
+        check.append(("Unet", "model."))
+    if merge_text_encoder:
+        check.append(("Text", "cond_stage_model."))
+    if merge_vae_encoder:
+        check.append(("Vae", "first_stage_model."))
+
+    if check:
+        names = ",".join([i[0] for i in check])
+        key_starts = [i[1] for i in check]
+
+        def startswith(key: str):
+            for start in key_starts:
+                if key.startswith(start):
+                    return True
+            return False
+
+        configs.append(MergeFn(names, startswith, merger))
+
+    configs.append(MergeFn("fallback", lambda key: True, fallback))
+    return configs
+
+
 def main(
-        inputs: List[Input], outputs: List[Output], output_dir: Optional[str],
+        inputs: List[Input], output_args: List[OutputArg], output_dir: Optional[str],
         overwrite: bool, precision: str, extended: bool, add_parent_dirs: Optional[int],
         name_prefix: Optional[str], extension: Optional[str], name_relative_factors: bool,
         merge_unet: bool, merge_text_encoder: bool, merge_vae_encoder: bool,
@@ -777,25 +796,15 @@ def main(
         raise ValueError("disabled merging everything")
 
     ensure_unique(inputs, lambda i: i.ident, ignored_keys = { None })
-    if not outputs:
+    if not output_args:
         raise ValueError("no outputs")
 
     if output_dir is not None:
         if not os.path.isdir(output_dir):
             raise ValueError("output dir not found or not a dir", output_dir)
 
-    basic_merge_fn = BasicMergeFns(
-        merge_weighted if merge_unet else None,
-        merge_weighted if merge_text_encoder else None,
-        merge_weighted if merge_vae_encoder else None,
-        _merge_use_first,
-    )
-    # res = inputs_outputs_merge_in_memory(inputs, [i.configs for i in outputs], merge_tensors_fn, precision = precision)
-
-    for i in outputs:
-        # Check for already existing errors in its own first pass
-        # to not create unnecessary empty output files in case of any errors.
-
+    outputs = []
+    for i in output_args:
         if i.path is None:
             if output_dir is None:
                 raise ValueError("no name/path given for output and not output_dir, can't create name/path")
@@ -809,10 +818,16 @@ def main(
         if not overwrite and os.path.exists(i.path):
             raise ValueError(f"output_file path exists already, overwriting disabled {i.path!r}")
 
-        if isinstance(i.config, BasicMerge):
-            if len(i.config.factors) != len(inputs):
-                raise ValueError(f"invalid number of output configs, expected {len(inputs)} like inputs but got {len(i.config.factors)}")
-            i.config.fn = basic_merge_fn
+        if i.config[0] == "basic":
+            if len(i.config[1].factors) != len(inputs):
+                raise ValueError(
+                    f"invalid number of output configs, expected {len(inputs)} like inputs but got {len(i.config[1].factors)}",
+                    i.config[1]
+                )
+
+        configs = _config_merge_fns(i.config[1], _merge_use_first, merge_unet, merge_text_encoder, merge_vae_encoder)
+        outputs.append(Output(i.path, configs))
+    ensure_unique(outputs, key = lambda out: out.path, ignored_keys = { "/dev/null" })
 
     for i in inputs:
         i.open()
@@ -832,7 +847,10 @@ def main(
             print("stripping ema model keys")
             statedict_strip_ema(sd, True)
 
-    ensure_unique(outputs, key = lambda out: out.path, ignored_keys = { "/dev/null" })
+    # configs = [_config_merge_fns(i.config[1], _merge_use_first, merge_unet, merge_text_encoder, merge_vae_encoder) for i in output_args]
+    # res = inputs_outputs_merge_in_memory(inputs, configs, merge_tensors, precision = precision)
+    # print(len(res))
+    # exit()
 
     for i in outputs:
         output_path = i.path
@@ -846,15 +864,13 @@ def main(
             print(f"writing to {output_path!r}, overwrite={overwrite}")
 
         i.write_path = write_path
-        print(f"opening merge output file {write_path!r}, config: {i.config}")
+        print(f"opening merge output file {write_path!r}, merge: {[(a.name, a.merger) for a in i.mergers]}")
         i.open(mode)
 
     start = time.monotonic()
     inputs_outputs_merge_torch_zip_stream(inputs, outputs, merge_tensors, precision = precision)
     end = time.monotonic()
     diff = end - start
-    print(f"took {diff:.2f} secs ({diff / 60:.2f} mins)")
-
     for i in outputs:
         i.close()
 
@@ -874,6 +890,7 @@ def main(
             print(f"setting access/modified times of {input_path!r} on {output_path!r}", (cur.st_atime_ns, cur.st_mtime_ns))
             os.utime(output_path, ns = (cur.st_atime_ns, cur.st_mtime_ns))
 
+    print(f"took {diff:.2f} secs ({diff / 60:.2f} mins)")
     print("done")
 
 
@@ -893,10 +910,10 @@ if __name__ == "__main__":
             if args.output_file_or_dir and args.output_file_or_dir[-1] in ("/", "\\"):
                 # is a dir, auto named later into output_dir
                 output_dir = args.output_file_or_dir
-                outputs = [Output(None, BasicMerge(factors))]
+                outputs = [OutputArg(None, ("basic", BasicMerge(factors)))]
             else:
                 output_dir = None
-                outputs = [Output(args.output_file_or_dir, BasicMerge(factors))]
+                outputs = [OutputArg(args.output_file_or_dir, ("basic", BasicMerge(factors)))]
 
             return inputs, outputs, output_dir
 
@@ -914,24 +931,24 @@ if __name__ == "__main__":
             else:
                 p = parsers[0]
 
-            res = p.parseString(expression)
+            res = p.parse_string(expression, parse_all = True)
             if len(res) != 1 or not isinstance(res[0], Merge):
                 raise ValueError("invalid expression", res)
-            return ExpressionMerge(res[0])
+            return ExpressionMerge(res[0], expression)
 
         def multi(args):
             inputs_basic = [Input(path, None) for path in args.input_file or []]
             inputs_named = [Input(path, name) for (path, name) in args.input_file_named or []]
             inputs = inputs_basic + inputs_named
 
-            outputs_unnamed = [Output(None, BasicMerge(parse_factors(factors))) for factors in args.output or []]
-            outputs_named = [Output(path, BasicMerge(parse_factors(factors))) for (path, factors) in args.output_file or []]
+            outputs_unnamed = [OutputArg(None, ("basic", BasicMerge(parse_factors(factors)))) for factors in args.output or []]
+            outputs_named = [OutputArg(path, ("basic", BasicMerge(parse_factors(factors)))) for (path, factors) in args.output_file or []]
 
             exp_unnamed = [
-                Output(None, parse_expression(exp)) for exp in args.output_expression or []
+                OutputArg(None, ("expression", parse_expression(exp))) for exp in args.output_expression or []
             ]
             exp_named = [
-                Output(path, parse_expression(exp)) for (path, exp) in args.output_expression_file or []
+                OutputArg(path, ("expression", parse_expression(exp))) for (path, exp) in args.output_expression_file or []
             ]
             outputs = outputs_unnamed + outputs_named + exp_unnamed + exp_named
 
