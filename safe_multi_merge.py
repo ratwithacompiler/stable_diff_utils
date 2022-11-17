@@ -44,6 +44,8 @@ else:
 from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_ema, statedict_strip_ema, _build_tensor
 
 import torch
+import merge_expression
+from merge_expression import Merge, Tens, Var, Minus
 
 logger = _logging.getLogger(__name__)
 IS_DEV = os.environ.get("DEV") == "1"
@@ -69,9 +71,29 @@ class Input():
 
 
 @dataclasses.dataclass()
+class BasicMergeFns():
+    model_merge_fn: Optional[Callable] = None
+    text_merge_fn: Optional[Callable] = None
+    vae_merge_fn: Optional[Callable] = None
+    fallback_merge_fn: Optional[Callable] = None
+
+
+@dataclasses.dataclass()
+class BasicMerge():
+    factors: List[Union[int, float]]
+    ignore_missing_tensors: bool = False
+    fn: Optional[BasicMergeFns] = None
+
+
+@dataclasses.dataclass()
+class ExpressionMerge():
+    merge: Merge
+
+
+@dataclasses.dataclass()
 class Output():
     path: Optional[str]
-    configs: List[Any]
+    config: Union[BasicMerge, ExpressionMerge]
 
     write_path: Optional[str] = None
     zip_file: Optional[ZipFile] = None
@@ -94,6 +116,12 @@ class Output():
         self.zip_file.close()
         self.zip_file = None
 
+    def configs(self, inputs_cnt):
+        if isinstance(self.config, BasicMerge):
+            return self.config.factors
+        else:
+            return [None for _ in range(inputs_cnt)]
+
 
 @dataclasses.dataclass()
 class LazyTensor():
@@ -109,12 +137,12 @@ class LazyTensor():
 
     tensor: Optional[torch.Tensor] = None
 
-    def load(self, reload = True):
-        if not reload and self.tensor is not None:
-            raise ValueError("tensor loaded already, reload not allowed")
+    def load(self, reload = False):
+        if self.tensor is not None and not reload:
+            return self.tensor
 
-        self.tensor = t = self.load_copy()
-        return t
+        self.tensor = self.load_copy()
+        return self.tensor
 
     def dtype(self):
         return DTYPE_MAP[self._storage_tup[1]][0]
@@ -189,40 +217,100 @@ def _merge_use_first(_ctx, vals: List[Any], _configs):
     return vals[0]
 
 
+class _MissingTensorError(Exception):
+    pass
+
+
+@dataclasses.dataclass()
+class ParseCtx():
+    var_map: Dict
+
+
+def _exp_get(ctx: ParseCtx, tens: Tens):
+    if isinstance(tens, Merge):
+        return _exp_run_merge(ctx, tens)
+
+    if isinstance(tens, Var):
+        return ctx.var_map[tens.name]
+
+    if isinstance(tens, Minus):
+        return _exp_run_minus(ctx, tens)
+
+    raise ValueError("unsupported tens", tens)
+
+
+def _exp_run_minus(ctx: ParseCtx, minus: Minus):
+    left = _exp_get(ctx, minus.left)
+    right = _exp_get(ctx, minus.right)
+    return torch.subtract(left, right)
+
+
+def _exp_run_merge(ctx: ParseCtx, merge: Merge):
+    factors_total = sum(i.factor for i in merge.items)
+
+    fact = merge.items[0].factor / factors_total
+    base = _exp_get(ctx, merge.items[0].item) * fact
+    print("fact", fact)
+    for i in merge.items[1:]:
+        tens = _exp_get(ctx, i.item)
+        fact = i.factor / factors_total
+        print("fact", fact)
+        base += tens * fact
+
+    return base
+
+
 def merge_tensors(
-        model_merge_fn: Callable,
-        text_merge_fn: Callable,
-        vae_merge_fn: Callable,
-        fallback_merge_fn: Callable,
+        # ignore_missing_tensors: bool,
         key: str,
+        ctx: Output,
         configs: List,
         inputs: List[Input],
         tensors: List[torch.Tensor],
         missing_inputs: List[Input],
         has_floats: bool, has_non_floats: bool,
 ) -> torch.Tensor:
+    if isinstance(ctx.config, BasicMerge):
+        return merge_tensors_weigthed(key, ctx.config, configs, tensors, missing_inputs, has_floats, has_non_floats)
+    if isinstance(ctx.config, ExpressionMerge):
+        if len(tensors) != len(inputs):
+            raise ValueError("huh", len(tensors), len(inputs))
+        pctx = ParseCtx({ i.ident: t for (t, i) in zip(tensors, inputs) })
+        return _exp_run_merge(pctx, ctx.config.merge)
+    raise NotImplementedError("unsupported config type", ctx.config)
+
+
+def merge_tensors_weigthed(
+        key: str,
+        conf: BasicMerge,
+        factors: List[Union[int, float]],
+        tensors: List[torch.Tensor],
+        missing_inputs: List[Input],
+        has_floats: bool, has_non_floats: bool,
+) -> torch.Tensor:
     if key.startswith("model."):
-        if has_non_floats or not has_floats:
-            raise ValueError("invalid model tensors", has_floats, has_non_floats, tensors)
-        if missing_inputs:
-            raise ValueError("missing model tensors", missing_inputs)
-        return model_merge_fn(None, tensors, configs)
-
+        fn, label = conf.fn.model_merge_fn, "model"
     elif key.startswith("cond_stage_model."):
-        if has_non_floats or not has_floats:
-            raise ValueError("invalid text tensors", has_floats, has_non_floats, tensors)
-        if missing_inputs:
-            raise ValueError("missing text tensors", missing_inputs)
-        return text_merge_fn(None, tensors, configs)
-
+        fn, label = conf.fn.text_merge_fn, "text"
     elif key.startswith("first_stage_model."):
-        if has_non_floats or not has_floats:
-            raise ValueError("invalid vae tensors", has_floats, has_non_floats, tensors)
-        if missing_inputs:
-            raise ValueError("missing vae tensors", missing_inputs)
-        return vae_merge_fn(None, tensors, configs)
+        fn, label = conf.fn.vae_merge_fn, "vae"
+    else:
+        fn, label = None, None
 
-    return fallback_merge_fn(None, tensors, configs)
+    if fn is not None:
+        try:
+            if has_non_floats or not has_floats:
+                raise ValueError(f"invalid {label} tensors", key, has_floats, has_non_floats, tensors)
+            if missing_inputs:
+                raise _MissingTensorError(f"missing {label} tensors", key, missing_inputs)
+            return fn(None, tensors, factors)
+        except _MissingTensorError:
+            if not conf.ignore_missing_tensors:
+                raise
+            print(f"ignoring missing {label} tensor", key)
+
+    print("fallback merge", key, len(tensors))
+    return conf.fn.fallback_merge_fn(None, tensors, factors)
 
 
 def state_dicts_merge(
@@ -243,6 +331,7 @@ def state_dicts_merge(
 
     print(len(all_keys))
     # print(sorted(all_keys))
+    pass
 
     if IS_DEV:
         print("IS_DEV cutting only!!!")
@@ -347,7 +436,7 @@ def state_dicts_merge(
     return [new_sd for merge_ctx, new_sd in new_sd_tups]
 
 
-def _tensors_configs_filter(configs: List, inputs: List[Input], maybe_tensors: List[Optional[torch.Tensor]]):
+def _tensors_configs_filter(configs: Optional[List], inputs: List[Input], maybe_tensors: List[Optional[torch.Tensor]]):
     # filter out None tensors and return with list of corresponding configs
     assert len(maybe_tensors) == len(inputs)
     assert len(maybe_tensors) == len(configs)
@@ -358,7 +447,7 @@ def _tensors_configs_filter(configs: List, inputs: List[Input], maybe_tensors: L
     missing_key = [i for (t, c, i) in combined if t is None and c is not SKIP_INPUT]
 
     if not with_tensor:
-        raise ValueError("no tensors", maybe_tensors, with_tensor)
+        raise ValueError("no tensors", len(maybe_tensors), len(with_tensor), maybe_tensors, with_tensor)
 
     inputs = [i for (t, c, i) in with_tensor]
     tensors = [t for (t, c, i) in with_tensor]
@@ -389,7 +478,15 @@ def _all_equal_basic(tensors: Iterable[torch.Tensor]):
     return True
 
 
+class _ZeroDimErr(Exception):
+    pass
+
+
 def _all_equal_data(tensors: Iterable[torch.Tensor]):
+    for i in tensors:
+        if i.dim() == 0:
+            raise _ZeroDimErr()
+
     tensors = [i.view(dtype = torch.uint8) for i in tensors]
     if not tensors:
         raise ValueError("no tensors")
@@ -418,18 +515,23 @@ def _all_equal_diff(tensors: Iterable[torch.Tensor]):
     return sum(diffs), diffs
 
 
-def _all_equal(tensors: Iterable[torch.Tensor]):
+def _all_equal(tensors: Iterable[torch.Tensor], key = None):
     e1 = _all_equal_basic(tensors)
-    e2 = _all_equal_data(tensors)
-    if e1 != e2:
-        raise ValueError("wtf??", e1, e2)
+    try:
+        e2 = _all_equal_data(tensors)
+        if e1 != e2:
+            raise ValueError("wtf??", e1, e2)
+    except _ZeroDimErr:
+        # logger.debug("ignoring zero dim _all_equal_data error for %r", key)
+        pass
+
     return e1
 
 
 def _single_tensor_check(tensors: List[torch.Tensor], skip_equal: bool, key = None) -> Optional[torch.Tensor]:
     if len(tensors) == 1:
         return torch.clone(tensors[0])
-    elif skip_equal and _all_equal(tensors):
+    elif skip_equal and _all_equal(tensors, key):
         logging.debug("skipping merging %s all equal tensors: %r", len(tensors), key)
         return torch.clone(tensors[0])
     return None
@@ -450,7 +552,7 @@ def inputs_outputs_merge_in_memory(
         used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs, inputs, maybe_tensors)
         if tensor := _single_tensor_check(tensors, skip_equal, key):
             return tensor
-        return merge_fn(key, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
+        return merge_fn(key, ctx, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
 
     sds = [i.state_dict() for i in inputs]
     outputs = [(i if isinstance(i, Output) else Output(None, i)) for i in configs_outputs]
@@ -498,25 +600,6 @@ class _OutputWriter():
         self.persistent_id = _create_persistent_id_fns()
 
 
-def _never_used_inputs(outputs: List[Output]) -> List[int]:
-    # returns a list of input position ids which are always skipped by
-    # every output config.
-
-    input_cnts = { len(i.configs) for i in outputs }
-    if len(input_cnts) != 1:
-        raise ValueError("different input counts", input_cnts)
-    input_cnt = list(input_cnts)[0]
-
-    use = [SKIP_INPUT for _ in range(input_cnt)]
-    for out in outputs:
-        for pos, conf in enumerate(out.configs):
-            if conf is not SKIP_INPUT:
-                use[pos] = True
-
-    never_used_ids = [pos for (pos, i) in enumerate(use) if i is SKIP_INPUT]
-    return never_used_ids
-
-
 def inputs_outputs_merge_torch_zip_stream(
         inputs: List[Union[Input, str]],
         outputs: List[Output],
@@ -546,10 +629,10 @@ def inputs_outputs_merge_torch_zip_stream(
     def merge_tensors(key: str, maybe_tensors: List[Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
         writer: _OutputWriter = output_writers[id(ctx)]
 
-        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs, inputs, maybe_tensors)
-        tensor = _single_tensor_check(tensors, skip_equal, key)
+        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(ctx.configs(len(inputs)), inputs, maybe_tensors)
+        tensor = None or _single_tensor_check(tensors, skip_equal, key)
         if tensor is None:
-            tensor = merge_fn(key, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
+            tensor = merge_fn(key, ctx, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
 
         # create fake classes that pickle serialize like torch.Tensor
         pers_id_tup = writer.persistent_id(tensor.storage())
@@ -570,10 +653,9 @@ def inputs_outputs_merge_torch_zip_stream(
         return _ReduceRes(reduced_res)
 
     sds = [i.state_dict() for i in inputs]
-    unused_inputs = _never_used_inputs(outputs)
     new_sds = state_dicts_merge(
         sds, outputs, require_all, merge_tensors, merge_non_tensors,
-        precision = precision, never_load_inputs = unused_inputs,
+        precision = precision,
     )
     assert len(new_sds) == len(outputs)
 
@@ -702,10 +784,12 @@ def main(
         if not os.path.isdir(output_dir):
             raise ValueError("output dir not found or not a dir", output_dir)
 
-    unet_fn = merge_weighted if merge_unet else _merge_use_first
-    text_fn = merge_weighted if merge_text_encoder else _merge_use_first
-    vae_fn = merge_weighted if merge_vae_encoder else _merge_use_first
-    merge_tensors_fn = functools.partial(merge_tensors, unet_fn, text_fn, vae_fn, _merge_use_first)
+    basic_merge_fn = BasicMergeFns(
+        merge_weighted if merge_unet else None,
+        merge_weighted if merge_text_encoder else None,
+        merge_weighted if merge_vae_encoder else None,
+        _merge_use_first,
+    )
     # res = inputs_outputs_merge_in_memory(inputs, [i.configs for i in outputs], merge_tensors_fn, precision = precision)
 
     for i in outputs:
@@ -725,8 +809,10 @@ def main(
         if not overwrite and os.path.exists(i.path):
             raise ValueError(f"output_file path exists already, overwriting disabled {i.path!r}")
 
-        if len(i.configs) != len(inputs):
-            raise ValueError(f"invalid number of output configs, expected {len(inputs)} like inputs but got {len(i.configs)}")
+        if isinstance(i.config, BasicMerge):
+            if len(i.config.factors) != len(inputs):
+                raise ValueError(f"invalid number of output configs, expected {len(inputs)} like inputs but got {len(i.config.factors)}")
+            i.config.fn = basic_merge_fn
 
     for i in inputs:
         i.open()
@@ -760,11 +846,11 @@ def main(
             print(f"writing to {output_path!r}, overwrite={overwrite}")
 
         i.write_path = write_path
-        print(f"opening merge output file {write_path!r}, factors: {i.configs}")
+        print(f"opening merge output file {write_path!r}, config: {i.config}")
         i.open(mode)
 
     start = time.monotonic()
-    inputs_outputs_merge_torch_zip_stream(inputs, outputs, merge_tensors_fn, precision = precision)
+    inputs_outputs_merge_torch_zip_stream(inputs, outputs, merge_tensors, precision = precision)
     end = time.monotonic()
     diff = end - start
     print(f"took {diff:.2f} secs ({diff / 60:.2f} mins)")
@@ -807,10 +893,10 @@ if __name__ == "__main__":
             if args.output_file_or_dir and args.output_file_or_dir[-1] in ("/", "\\"):
                 # is a dir, auto named later into output_dir
                 output_dir = args.output_file_or_dir
-                outputs = [Output(None, factors)]
+                outputs = [Output(None, BasicMerge(factors))]
             else:
                 output_dir = None
-                outputs = [Output(args.output_file_or_dir, factors)]
+                outputs = [Output(args.output_file_or_dir, BasicMerge(factors))]
 
             return inputs, outputs, output_dir
 
@@ -819,14 +905,35 @@ if __name__ == "__main__":
             factors = [(SKIP_INPUT if i.strip().lower() in ("s", "skip") else parse_num(i)) for i in factors]
             return factors
 
+        parsers = []
+
+        def parse_expression(expression: str) -> ExpressionMerge:
+            if not parsers:
+                p = merge_expression.make_parser(True)
+                parsers.append(p)
+            else:
+                p = parsers[0]
+
+            res = p.parseString(expression)
+            if len(res) != 1 or not isinstance(res[0], Merge):
+                raise ValueError("invalid expression", res)
+            return ExpressionMerge(res[0])
+
         def multi(args):
             inputs_basic = [Input(path, None) for path in args.input_file or []]
             inputs_named = [Input(path, name) for (path, name) in args.input_file_named or []]
             inputs = inputs_basic + inputs_named
 
-            outputs_unnamed = [Output(None, parse_factors(factors)) for factors in args.output or []]
-            outputs_named = [Output(path, parse_factors(factors)) for (path, factors) in args.output_file or []]
-            outputs = outputs_unnamed + outputs_named
+            outputs_unnamed = [Output(None, BasicMerge(parse_factors(factors))) for factors in args.output or []]
+            outputs_named = [Output(path, BasicMerge(parse_factors(factors))) for (path, factors) in args.output_file or []]
+
+            exp_unnamed = [
+                Output(None, parse_expression(exp)) for exp in args.output_expression or []
+            ]
+            exp_named = [
+                Output(path, parse_expression(exp)) for (path, exp) in args.output_expression_file or []
+            ]
+            outputs = outputs_unnamed + outputs_named + exp_unnamed + exp_named
 
             return inputs, outputs, args.output_dir
 
@@ -875,13 +982,17 @@ if __name__ == "__main__":
         multi_parser.add_argument("-O", "--output", action = "append",
                                   help = "auto named output file, output-dir required")
 
+        multi_parser.add_argument("-e", "--output-expression-file", nargs = 2, action = "append")
+        multi_parser.add_argument("-E", "--output-expression", action = "append",
+                                  help = "auto named output file, output-dir required")
+
         multi_parser.add_argument("output_dir", nargs = "?")
 
         args = parser.parse_args()
         _logging.basicConfig(level = _logging.DEBUG)
 
         inputs, outputs, output_dir = args.fn(args)
-        # print(args)
+        print(args)
         # print(inputs)
         # print(outputs)
         # exit()
