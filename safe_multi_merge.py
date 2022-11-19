@@ -299,6 +299,50 @@ def merge_tensors(
     raise NotImplementedError("unsupported merge type", merge)
 
 
+def _precision_arg(state_dicts: List[dict], precision: str = "auto", log = False) -> torch.dtype:
+    if precision not in ("fp32", "fp16", "auto"):
+        raise ValueError("invalid precision", precision)
+
+    if precision != "auto":
+        return {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+        }[precision]
+
+    expected_floats = { torch.float16, torch.float32 }
+    # auto precision, check one key shared by all for dtypes,
+    # used fp32 if any are fp32 otherwise f16
+
+    shared_keys = set(state_dicts[0].keys())
+    for i in state_dicts[1:]:
+        shared_keys = shared_keys & i.keys()
+
+    # check the "model." key with the longest name if there is any,
+    # otherwise longest key name overall
+    model_keys = [i for i in shared_keys if i.startswith("model.")]
+    longest_model_key = max(model_keys or shared_keys, key = lambda i: len(i))
+
+    get_dtype = lambda tens_or_lazy: tens_or_lazy.dtype() if isinstance(tens_or_lazy, LazyTensor) else tens_or_lazy.dtype
+    dtypes = { get_dtype(sd[longest_model_key]) for sd in state_dicts }
+    has_floats = dtypes & expected_floats
+    non_floats = dtypes - expected_floats
+    if non_floats:
+        raise ValueError("got non floats for model keys, huh?", dtypes)
+
+    if len(has_floats) == 1:
+        use_precision = list(has_floats)[0]
+        if log:
+            logger.debug("using only seen precision: %s", use_precision)
+    else:
+        if has_floats != expected_floats:
+            raise ValueError("expected fp16 and fp32 here", dtypes)
+        use_precision = torch.float32
+        if log:
+            logger.debug("using best seen precision: %s", use_precision)
+
+    return use_precision
+
+
 def state_dicts_merge(
         state_dicts: List[dict],
         merge_contexts: List[Any],
@@ -309,15 +353,8 @@ def state_dicts_merge(
         precision: str = "auto",
         never_load_inputs: Optional[Set[int]] = None,
 ) -> List[Dict]:
-    if precision not in ("fp32", "fp16", "auto"):
-        raise ValueError("invalid precision", precision)
-
     state_dicts = list(state_dicts)
     all_keys = set(itertools.chain(*state_dicts))
-
-    print(len(all_keys))
-    # print(sorted(all_keys))
-    pass
 
     if IS_DEV:
         print("IS_DEV cutting only!!!")
@@ -328,33 +365,7 @@ def state_dicts_merge(
         # @formatter:on
 
     expected_floats = { torch.float16, torch.float32 }
-    if precision == "auto":
-        longest_model_key = max([i for i in all_keys if i.startswith("model.")], key = lambda i: len(i))
-        lazy_tensors = []
-        for sd in state_dicts:
-            val = sd.get(longest_model_key)
-            if isinstance(val, LazyTensor):
-                lazy_tensors.append(val)
-
-        dtypes = { i.dtype() for i in lazy_tensors if i is not None }
-        has_floats = dtypes & expected_floats
-        non_floats = dtypes - expected_floats
-        if non_floats:
-            raise ValueError("got non floats for model keys, huh?", dtypes)
-
-        if len(has_floats) == 1:
-            use_precision = list(has_floats)[0]
-            logger.debug("using only seen precision: %s", use_precision)
-        else:
-            if has_floats != expected_floats:
-                raise ValueError("expected fp16 and fp32 here", dtypes)
-            use_precision = torch.float32
-            logger.debug("using best seen precision: %s", use_precision)
-    else:
-        use_precision = {
-            "fp32": torch.float32,
-            "fp16": torch.float16,
-        }[precision]
+    use_precision = _precision_arg(state_dicts, precision, True)
 
     merge_contexts = list(merge_contexts)
     new_sd_tups = [(i, { }) for i in merge_contexts]
