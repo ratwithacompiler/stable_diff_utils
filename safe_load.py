@@ -103,7 +103,7 @@ def statedict_convert_ema(sd: dict, optional: bool, print_stats: bool = False, v
     return sd, stripped
 
 
-def statedict_strip_ema(sd: dict, print_stats: bool = False):
+def statedict_strip_ema(sd: dict, print_stats: bool = False, verbose: bool = False):
     stripped = { }
     for key, val in sd.items():
         if key.startswith("model_ema."):
@@ -113,7 +113,10 @@ def statedict_strip_ema(sd: dict, print_stats: bool = False):
         del sd[key]
 
     if print_stats:
-        print(f"stripped {len(stripped)} ema model keys from state_dict: {sorted(stripped.keys())}")
+        if verbose:
+            print(f"stripped {len(stripped)} ema model keys from state_dict: {sorted(stripped.keys())}")
+        else:
+            print(f"stripped {len(stripped)} ema model keys from state_dict")
 
     return sd, stripped
 
