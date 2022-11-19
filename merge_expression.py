@@ -6,10 +6,12 @@ from dataclasses import dataclass
 import sys
 
 if sys.version_info[:2] >= (3, 9):
-    from typing import Union, Optional, Any, TypeVar, List, Tuple, Type, Dict
+    from typing import Union, Optional, Any, TypeVar, List, Tuple, Type, Dict, Set
     from collections.abc import Iterable, Callable, Generator, AsyncGenerator, Collection
 else:
     from typing import Dict, List, Tuple, Set, Union, Optional, Iterable, Type, Callable, Any, Generator, TypeVar
+
+from type_utils import ensure_type, ensure, ensure_equal
 
 
 class Tens():
@@ -58,29 +60,6 @@ class Minus(Tens):
 # @dataclass()
 # class Group(Tens):
 #     item: Tens
-
-
-def ensure(truthy, msg = None, *args):
-    if not truthy:
-        raise ValueError("ensure truthy error", *([msg] or []), truthy, *args)
-
-
-def ensure_equal(val, expected, msg = None, *args):
-    if val != expected:
-        raise ValueError("ensure equal error", *([msg] or []), val, expected, *args)
-
-
-def ensure_type(item, expected: Union[Type, Iterable[Type]], msg = None, *args):
-    try:
-        expected = list(expected)
-    except:
-        expected = [expected]
-
-    for t in expected:
-        if isinstance(item, t):
-            return
-
-    raise ValueError("ensure type error", *([msg] or []), type(item), expected, item, *args)
 
 
 def var_parse_action(section, pos, res):
@@ -209,82 +188,34 @@ def merge_to_str(merge):
     return _exp_run_merge(merge)
 
 
-def _run_expression_str(parser, expression: str, ):
-    print("\n" * 3)
-    print("checking", repr(expression))
+def merge_vars(merge: Merge) -> Set[str]:
+    seen_vars = set()
+
+    def _exp_get(tens: Tens):
+        if isinstance(tens, Merge):
+            _exp_run_merge(tens)
+        elif isinstance(tens, Var):
+            seen_vars.add(tens.name)
+        elif isinstance(tens, Minus):
+            _exp_run_minus(tens)
+        else:
+            raise ValueError("unsupported tens", tens)
+
+    def _exp_run_minus(minus: Minus):
+        _exp_get(minus.left)
+        _exp_get(minus.right)
+
+    def _exp_run_merge(merge: Merge):
+        for i in merge.items:
+            _exp_get(i.item)
+
+    _exp_run_merge(merge)
+    return seen_vars
+
+
+def parse_merge_expression(parser, expression: str) -> Merge:
     full = parser.parse_string(expression, parse_all = True)
     ensure_equal(len(full), 1)
-    merge: Merge = full[0]
+    merge = full[0]
     ensure_type(merge, Merge, "expected Merge at root")
-    print("  ", merge)
-    print(merge_to_str(merge))
-    return
-
-    @dataclass()
-    class ParseCtx():
-        var_map: Dict
-
-    def _get(ctx: ParseCtx, tens: Tens):
-        if isinstance(tens, Merge):
-            return run_merge(ctx, tens)
-
-        if isinstance(tens, Var):
-            # return ctx.var_map[tens.name]
-            return f"Var({tens.name})"
-
-        if isinstance(tens, Minus):
-            return run_minus(ctx, tens)
-
-        raise ValueError("unsupported tens", tens)
-
-    def run_minus(ctx: ParseCtx, minus: Minus):
-        left = _get(ctx, minus.left)
-        right = _get(ctx, minus.right)
-        return f"Minus({left}-{right})"
-
-    def run_merge(ctx: ParseCtx, merge: Merge):
-        factors_total = sum(i.factor for i in merge.items)
-
-        base = _get(ctx, merge.items[0].item) * max(1, round(merge.items[0].factor))
-        for i in merge.items[1:]:
-            tens = _get(ctx, i.item)
-            base += tens * max(1, round(i.factor))
-
-        print("base", base)
-        return base
-
-    ctx = ParseCtx({ })
-    run_merge(ctx, merge)
-
-    # print(type(e))
-    # print(repr(e))
-    # ensure()
-    print(full)
-
-
-if __name__ == '__main__':
-    test = [
-        # "Any3 + (Gibli-SD14) + (DisEl-SD15) + Otherr*0.7 + Yas1800*1.3",
-        # "Any3 + (Gibli-SD14) + (DisEl-SD15) + (Otherr*0.7 + Yas1800*1.3)",
-        # "Any3 +  (Otherr*0.7 + Yas1800*1.3 + HUH)",
-        "Any3 + (Gibli-SD14)*4 + (Mre+HUH+ (a-b))",
-        # "Any3 + BBB + CCC + (DDDD + EEE + EE2222) + FFFF + GGGG + HHHH",
-        # "Woop*10 + HUH*1",
-        # "Woop*2 + HUH",
-        # "Woop*2",
-        # "(yas1800-SD_1.5) * 1 + DisEl*2 + Anyt ",
-        # "(WOOP-(SD_1.5*2 + SD1.4*1)-(SD_1.5*2 + SD1.4*1)-WOOP)*1 + (DisEl)*2 + (Anyt *3 + HUH*3)*4",
-        # "(T111)*2 + (M222*3 + M444*3)*4",
-        # "T111*2 + (M222*3 + M444*3)*4 + (HMM-SD)*1",
-        # "T111 + (M222*3 + M444*3)*4",
-        # "(yas1800-SD15) * 1 + DisEl*2 + Anyt ",
-    ]
-    p = make_parser()
-    for t in test:
-        # print(t)
-        # e = p.parseString(t)
-        # ensure(len(e) == 1),al
-        # e = e[0]
-        # print(e)
-        _run_expression_str(p, t)
-        pass
+    return merge
