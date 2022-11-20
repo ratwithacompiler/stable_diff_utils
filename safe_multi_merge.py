@@ -103,6 +103,7 @@ class OutputArg():
 class Output():
     path: Optional[str]
     mergers: List[MergeFn]
+    missing_key_fallback_fn: Optional[Callable] = None
 
     write_path: Optional[str] = None
     zip_file: Optional[ZipFile] = None
@@ -162,7 +163,7 @@ class LazyTensor():
 
     tensor: Optional[torch.Tensor] = None
 
-    def load(self, reload = False):
+    def load(self, reload = False, dtype = None):
         if self.tensor is not None and not reload:
             return self.tensor
 
@@ -239,7 +240,10 @@ def merge_weighted(_ctx, tensors: List[torch.Tensor], factors: List[Union[int, f
 
 def _merge_use_first(_ctx, vals: List[Any], _configs):
     # print("_merge_use_first!!!", ctx, len(vals), str(vals).replace("\n","")[:100], factors)
-    return vals[0]
+    for i in vals:
+        if i is not None:
+            return i
+    raise ValueError("no non None value found", vals)
 
 
 class _MissingTensorError(Exception):
@@ -249,6 +253,14 @@ class _MissingTensorError(Exception):
 @dataclasses.dataclass()
 class ParseCtx():
     var_map: Dict
+    key: str
+
+
+class ModelKeyError(KeyError):
+    def __init__(self, model_name: str, key_name: str, *args):
+        super().__init__(model_name, key_name, *args)
+        self.model_name = model_name
+        self.key_name = key_name
 
 
 def _exp_get(ctx: ParseCtx, tens: Tens):
@@ -256,7 +268,10 @@ def _exp_get(ctx: ParseCtx, tens: Tens):
         return _exp_run_merge(ctx, tens)
 
     if isinstance(tens, Var):
-        return ctx.var_map[tens.name]
+        try:
+            return ctx.var_map[tens.name]
+        except KeyError:
+            raise ModelKeyError(tens.name, ctx.key) from None
 
     if isinstance(tens, Minus):
         return _exp_run_minus(ctx, tens)
@@ -306,23 +321,30 @@ def merge_tensors(
 ) -> torch.Tensor:
     merge = ctx.key_merge(key)
 
-    if isinstance(merge, ExpressionMerge):
-        if len(tensors) != len(inputs):
-            raise ValueError("huh", len(tensors), len(inputs))
-        pctx = ParseCtx({ i.ident: t for (t, i) in zip(tensors, inputs) })
-        return _exp_run(pctx, merge.merge)
+    try:
+        if isinstance(merge, ExpressionMerge):
+            if len(tensors) != len(inputs):
+                raise ValueError("huh", len(tensors), len(inputs))
+            pctx = ParseCtx({ i.ident: t for (t, i) in zip(tensors, inputs) }, key)
+            return _exp_run(pctx, merge.merge)
 
-    if isinstance(merge, BasicMerge):
-        if has_non_floats or not has_floats:
-            raise ValueError(f"invalid tensors", key, has_floats, has_non_floats, tensors)
-        if missing_inputs:
-            raise _MissingTensorError(f"missing tensors", key, missing_inputs)
-        return merge_weighted(ctx, tensors, configs)
+        if isinstance(merge, BasicMerge):
+            if has_non_floats or not has_floats:
+                raise ValueError(f"invalid tensors", key, has_floats, has_non_floats, tensors)
+            if missing_inputs:
+                raise _MissingTensorError(f"missing tensors", key, missing_inputs)
+            return merge_weighted(ctx, tensors, configs)
 
-    if callable(merge):
-        return merge(ctx, tensors, configs)
+        if callable(merge):
+            return merge(ctx, tensors, configs)
+    except ModelKeyError as ex:
+        logger.warning("model missing required, using fallback choice fn: %s, key: %r, model: %r",
+                       ctx.missing_key_fallback_fn, key, ex.model_name)
+        if ctx.missing_key_fallback_fn is not None:
+            return ctx.missing_key_fallback_fn(ctx, tensors, configs)
+        raise
 
-    # return i.merger(key, ctx, configs, inputs, tensors, missing_inputs, has_floats, has_non_floats)
+        # return i.merger(key, ctx, configs, inputs, tensors, missing_inputs, has_floats, has_non_floats)
     raise NotImplementedError("unsupported merge type", merge)
 
 
@@ -439,12 +461,10 @@ def state_dicts_merge(
             is_mixed = True
 
         # print(key, lazy_tensors)
-        tensors = []
-        for pos, i in enumerate(lazy_tensors):
-            tensors.append(i.load_copy() if i is not None else None)
-
         if has_floats:
-            tensors = [i.to(use_precision) if i is not None else None for i in tensors]
+            tensors = [(i.load_copy() if i is not None else None) for i in lazy_tensors]
+        else:
+            tensors = [(i.load_copy().to(use_precision) if i is not None else None) for i in lazy_tensors]
 
         sizes = { i.storage().nbytes() for i in tensors if i is not None }
         if len(sizes) > 1:
@@ -559,6 +579,20 @@ def _single_tensor_check(tensors: List[torch.Tensor], skip_equal: bool, key = No
     return None
 
 
+def _unknown_vars(inputs: List[Input], outputs: List[Output]) -> List[str]:
+    known_input_ids = { i.ident for i in inputs if i.ident }
+    unknown_all = set()
+    for out in outputs:
+        for merger in out.mergers:
+            if isinstance(merger.merger, ExpressionMerge):
+                used_vars = merge_expression.runexp_vars(merger.merger.merge)
+                unknown = set(used_vars) - known_input_ids
+                if unknown:
+                    unknown_all.update(unknown)
+
+    return sorted(unknown_all)
+
+
 def _never_used_inputs(inputs: List[Input], outputs: List[Output]) -> List[int]:
     # returns a list of input position ids which are always skipped by
     # every output config.
@@ -608,10 +642,19 @@ def inputs_outputs_merge_in_memory(
 
     sds = [i.state_dict() for i in inputs]
     outputs = [(i if isinstance(i, Output) else Output(None, i)) for i in configs_outputs]
+    unknown = _unknown_vars(inputs, outputs)
+    if unknown:
+        raise ValueError("expression used unknown model names",
+                         unknown, sorted(i.ident for i in inputs if i.ident))
     unused_input_idxs = _never_used_inputs(inputs, outputs)
+    if unused_input_idxs:
+        logger.info("not loading %s unused inputs: %s", len(unused_input_idxs),
+                    [inputs[idx].ident or f"in[{idx}]" for idx in unused_input_idxs])
+
     new_sds = state_dicts_merge(
         sds, outputs, require_all, merge_tensors, merge_non_tensors,
         precision = precision, never_load_inputs = unused_input_idxs,
+        work_iter = tqdm.tqdm if tqdm else None,
     )
     return new_sds
 
@@ -708,9 +751,18 @@ def inputs_outputs_merge_torch_zip_stream(
 
     sds = [i.state_dict() for i in inputs]
     unused_input_idxs = _never_used_inputs(inputs, outputs)
+    if unused_input_idxs:
+        logger.info("not loading %s unused inputs: %s", len(unused_input_idxs),
+                    [inputs[idx].ident or f"in[{idx}]" for idx in unused_input_idxs])
+    unknown = _unknown_vars(inputs, outputs)
+    if unknown:
+        raise ValueError("expression used unknown model names",
+                         unknown, sorted(i.ident for i in inputs if i.ident))
+
     new_sds = state_dicts_merge(
         sds, outputs, require_all, merge_tensors, merge_non_tensors,
         precision = precision, never_load_inputs = unused_input_idxs,
+        work_iter = tqdm.tqdm if tqdm else None,
     )
     assert len(new_sds) == len(outputs)
 
@@ -867,6 +919,7 @@ def main(
         name_prefix: Optional[str], extension: Optional[str],
         name_original_expression: bool, name_relative_factors: bool,
         merge_unet: bool, merge_text_encoder: bool, merge_vae_encoder: bool,
+        missing_key_fallback: bool,
         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
         set_times: bool, use_tmpfile: bool):
     if not inputs:
@@ -883,6 +936,7 @@ def main(
         if not os.path.isdir(output_dir):
             raise ValueError("output dir not found or not a dir", output_dir)
 
+    fallback_fn = _merge_use_first if missing_key_fallback else None
     outputs = []
     for i in output_args:
         if i.path is None:
@@ -907,7 +961,7 @@ def main(
                 )
 
         configs = _config_merge_fns(i.config[1], _merge_use_first, merge_unet, merge_text_encoder, merge_vae_encoder)
-        outputs.append(Output(i.path, configs))
+        outputs.append(Output(i.path, configs, fallback_fn))
     ensure_unique(outputs, key = lambda out: out.path, ignored_keys = { "/dev/null" })
 
     for i in inputs:
@@ -1059,6 +1113,8 @@ if __name__ == "__main__":
         parser.add_argument("--name-prefix", default = "merged_")
         parser.add_argument("-f", "--name-original-factors", action = "store_true")
         parser.add_argument("--name-original-expression", action = "store_true")
+        parser.add_argument("-m", "--missing-key-first-fallback", action = "store_true",
+                            help = "if a needed key is missing in one of the models fall back to the first available one")
 
         parser.add_argument("-P", "--parent-dirs", type = int,
                             help = "add the names of up to [n] parent directories in front of each input name when generating output filename")
@@ -1100,6 +1156,7 @@ if __name__ == "__main__":
             args.name_prefix, args.name_ext,
             args.name_original_expression, not args.name_original_factors,
             not args.no_merge_unet, not args.no_merge_text_encoder, not args.no_merge_vae,
+            args.missing_key_first_fallback,
             args.ema_rename, args.ema_rename_try, args.ema_strip,
             args.times, not args.no_tempfile,
         )
