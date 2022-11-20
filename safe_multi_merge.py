@@ -390,7 +390,7 @@ def state_dicts_merge(
     if IS_DEV:
         print("IS_DEV cutting only!!!")
         # @formatter:off
-        only = []
+        only = ['cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.out_proj.bias','cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.out_proj.weight','cond_stage_model.transformer.embeddings.position_embedding.weight','cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.q_proj.bias','cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.q_proj.weight','cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.v_proj.bias','cond_stage_model.transformer.text_model.encoder.layers.1.self_attn.v_proj.weight','cond_stage_model.transformer.text_model.encoder.layers.10.layer_norm1.bias','cond_stage_model.transformer.text_model.encoder.layers.10.layer_norm1.weight','model.diffusion_model.input_blocks.8.0.out_layers.0.weight','model.diffusion_model.input_blocks.8.0.out_layers.3.bias', 'model.diffusion_model.input_blocks.8.0.out_layers.3.weight','model.diffusion_model.input_blocks.8.1.norm.bias', 'model.diffusion_model.input_blocks.8.1.norm.weight','model.diffusion_model.input_blocks.8.1.proj_in.bias','model.diffusion_model.input_blocks.8.1.proj_in.weight', 'model.diffusion_model.input_blocks.8.1.proj_out.bias','model.diffusion_model.input_blocks.8.1.proj_out.weight','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_k.weight','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_out.0.bias','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_out.0.weight','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_q.weight','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn1.to_v.weight','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_k.weight','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_out.0.bias','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_out.0.weight','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_q.weight','model.diffusion_model.input_blocks.8.1.transformer_blocks.0.attn2.to_v.weight''first_stage_model.encoder.down.3.block.1.norm2.weight','first_stage_model.encoder.mid.attn_1.k.bias','first_stage_model.encoder.mid.attn_1.k.weight','first_stage_model.encoder.mid.attn_1.norm.bias','first_stage_model.encoder.mid.attn_1.norm.weight','first_stage_model.encoder.mid.attn_1.proj_out.bias','first_stage_model.encoder.mid.attn_1.proj_out.weight','first_stage_model.encoder.mid.attn_1.q.bias','first_stage_model.encoder.mid.attn_1.q.weight','first_stage_model.encoder.mid.attn_1.v.bias','first_stage_model.encoder.mid.attn_1.v.weight','first_stage_model.encoder.mid.block_1.conv1.bias','first_stage_model.encoder.mid.block_1.conv1.weight','first_stage_model.encoder.mid.block_1.conv2.bias','first_stage_model.encoder.mid.block_1.conv2.weight','first_stage_model.encoder.mid.block_1.norm1.bias','first_stage_model.encoder.mid.block_1.norm1.weight','first_stage_model.encoder.mid.block_1.norm2.bias','first_stage_model.encoder.mid.block_1.norm2.weight','first_stage_model.encoder.mid.block_2.conv1.bias','first_stage_model.encoder.mid.block_2.conv1.weight']
         all_keys = all_keys & set(only)
         del only
         # @formatter:on
@@ -1038,8 +1038,8 @@ if __name__ == "__main__":
         parser.add_argument("-o", "--overwrite", action = "store_true")
         parser.add_argument("-v", "--verbose", action = "store_true")
 
-        parser.add_argument("-T", "--merge-text-encoder", action = "store_true")
-        parser.add_argument("-V", "--merge-vae", action = "store_true")
+        parser.add_argument("-T", "--no-merge-text-encoder", action = "store_true")
+        parser.add_argument("-V", "--no-merge-vae", action = "store_true")
         parser.add_argument("-U", "--no-merge-unet", action = "store_true")
 
         parser.add_argument("-p", "--precision", choices = ["auto", "fp16", "fp32"], default = "auto",
@@ -1099,7 +1099,7 @@ if __name__ == "__main__":
             args.overwrite, args.precision, not args.simple, args.parent_dirs,
             args.name_prefix, args.name_ext,
             args.name_original_expression, not args.name_original_factors,
-            not args.no_merge_unet, args.merge_text_encoder, args.merge_vae,
+            not args.no_merge_unet, not args.no_merge_text_encoder, not args.no_merge_vae,
             args.ema_rename, args.ema_rename_try, args.ema_strip,
             args.times, not args.no_tempfile,
         )
