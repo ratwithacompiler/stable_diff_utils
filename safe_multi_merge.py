@@ -106,13 +106,20 @@ class Output():
 
     write_path: Optional[str] = None
     zip_file: Optional[ZipFile] = None
+    zip_file_file: Optional[io.FileIO] = None
     model: Optional[dict] = None
 
-    def open(self, mode: str, compression = zipfile.ZIP_STORED, compresslevel = None):
-        if self.zip_file is not None:
-            raise ValueError("already open", self.path)
+    def open(self, mode: str, compression = zipfile.ZIP_STORED, compresslevel = None, with_file = False):
+        if self.zip_file is not None or self.zip_file_file is not None:
+            raise ValueError("already open", self.path, self.zip_file, self.zip_file_file)
 
-        self.zip_file = ZipFile(self.write_path, mode = mode, compression = compression, compresslevel = compresslevel)
+        if with_file:
+            open_mode = mode.replace("b", "") + "b"
+            self.zip_file_file = open_arg = open(self.write_path, open_mode)
+        else:
+            open_arg = self.write_path
+
+        self.zip_file = ZipFile(open_arg, mode = mode, compression = compression, compresslevel = compresslevel)
 
     def open_buffer(self, mode: str, compression = zipfile.ZIP_STORED, compresslevel = None):
         if self.zip_file is not None:
@@ -124,6 +131,7 @@ class Output():
     def close(self):
         self.zip_file.close()
         self.zip_file = None
+        self.zip_file_file = None
 
     def key_merge(self, key) -> Merger:
         for i in self.mergers:
@@ -754,6 +762,7 @@ def _make_output_path(
         add_parent_dirnames: Optional[int] = None,
         prefix: Optional[str] = None,
         extension: Optional[str] = None,
+        original_expression: bool = False,
         relative_factors: bool = True,
 ):
     add_parent_dirnames = int(add_parent_dirnames or 0)
@@ -789,12 +798,16 @@ def _make_output_path(
             parts.append(p)
         full_name = "_+_".join(parts)
     elif output_arg.config[0] == "expression":
-        full_name = runexp_to_str(output_arg.config[1].merge, True)
-        # full_name = output_arg.config[1].original_expression
+        if original_expression:
+            full_name = output_arg.config[1].original_expression
+        else:
+            full_name = runexp_to_str(output_arg.config[1].merge, use_original_factor = not relative_factors)
         # print(full_name)
         pass
     else:
         raise ValueError("unsupported output config", output_arg.config[0])
+
+    full_name = full_name.replace(" ", "_")
 
     flags = []
     if merge_unet:
@@ -851,7 +864,8 @@ def _config_merge_fns(merger, fallback, merge_unet: bool, merge_text_encoder: bo
 def main(
         inputs: List[Input], output_args: List[OutputArg], output_dir: Optional[str],
         overwrite: bool, precision: str, extended: bool, add_parent_dirs: Optional[int],
-        name_prefix: Optional[str], extension: Optional[str], name_relative_factors: bool,
+        name_prefix: Optional[str], extension: Optional[str],
+        name_original_expression: bool, name_relative_factors: bool,
         merge_unet: bool, merge_text_encoder: bool, merge_vae_encoder: bool,
         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
         set_times: bool, use_tmpfile: bool):
@@ -878,7 +892,8 @@ def main(
             i.path = _make_output_path(
                 inputs, i, output_dir,
                 merge_unet, merge_text_encoder, merge_vae_encoder,
-                add_parent_dirs, name_prefix, extension, name_relative_factors,
+                add_parent_dirs, name_prefix, extension,
+                name_original_expression, name_relative_factors,
             )
 
         if not overwrite and os.path.exists(i.path):
@@ -931,7 +946,7 @@ def main(
 
         i.write_path = write_path
         print(f"opening merge output file {write_path!r}, merge: {[(a.name, a.merger) for a in i.mergers]}")
-        i.open(mode)
+        i.open(mode, with_file = True)
 
     start = time.monotonic()
     inputs_outputs_merge_torch_zip_stream(inputs, outputs, merge_tensors, precision = precision)
@@ -1026,7 +1041,6 @@ if __name__ == "__main__":
         parser.add_argument("-T", "--merge-text-encoder", action = "store_true")
         parser.add_argument("-V", "--merge-vae", action = "store_true")
         parser.add_argument("-U", "--no-merge-unet", action = "store_true")
-        parser.add_argument("-f", "--full-factors-name", action = "store_true")
 
         parser.add_argument("-p", "--precision", choices = ["auto", "fp16", "fp32"], default = "auto",
                             help = '"auto" uses "fp32" if any of the tensors are fp32 otherwise uses "fp16"')
@@ -1043,6 +1057,8 @@ if __name__ == "__main__":
         parser.add_argument("-N", "--no-tempfile", action = "store_true", help = "write to output file directly, don't use tempfile and rename")
         parser.add_argument("--name-ext", default = "ckpt")
         parser.add_argument("--name-prefix", default = "merged_")
+        parser.add_argument("-f", "--name-original-factors", action = "store_true")
+        parser.add_argument("--name-original-expression", action = "store_true")
 
         parser.add_argument("-P", "--parent-dirs", type = int,
                             help = "add the names of up to [n] parent directories in front of each input name when generating output filename")
@@ -1081,7 +1097,8 @@ if __name__ == "__main__":
         main(
             inputs, outputs, output_dir,
             args.overwrite, args.precision, not args.simple, args.parent_dirs,
-            args.name_prefix, args.name_ext, not args.full_factors_name,
+            args.name_prefix, args.name_ext,
+            args.name_original_expression, not args.name_original_factors,
             not args.no_merge_unet, args.merge_text_encoder, args.merge_vae,
             args.ema_rename, args.ema_rename_try, args.ema_strip,
             args.times, not args.no_tempfile,

@@ -99,10 +99,14 @@ def mul_parse_action(section, pos, full):
     ensure_type(res[0], Tens, "left mul op must be Tensor", res[0], full)
     ensure_equal(res[1], FACTOR_CHAR)
 
-    ensure_type(res[2], str)
-    num = float(res[2]) if res[2].count(".") else int(res[2])
-
-    return Factored(res[0], num, res[2])
+    num_str = res[2]
+    if isinstance(num_str, int):
+        num = num_str
+        num_str = str(num_str)
+    else:
+        num = float(num_str) if num_str.count(".") else int(num_str)
+    ensure_type(num_str, str)
+    return Factored(res[0], num, num_str)
 
 
 def minus_parse_action(section, pos, full):
@@ -286,6 +290,7 @@ def runexp_vars(runexp: RunExp) -> Set[str]:
 
 
 def parse_run_expression(parser, expression: str) -> RunExp:
+    print("huh", repr(expression))
     full = parser.parse_string(expression, parse_all = True)
     ensure_equal(len(full), 1)
     exp = full[0]
