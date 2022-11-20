@@ -47,7 +47,7 @@ from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_
 
 import torch
 import merge_expression
-from merge_expression import Merge, Tens, Var, Minus, merge_to_str
+from merge_expression import Merge, RunExp, Tens, Var, Minus, runexp_to_str
 
 logger = _logging.getLogger(__name__)
 IS_DEV = os.environ.get("DEV") == "1"
@@ -79,7 +79,7 @@ class BasicMerge():
 
 @dataclasses.dataclass()
 class ExpressionMerge():
-    merge: Merge
+    merge: RunExp
     original_expression: Optional[str] = None
 
 
@@ -253,6 +253,9 @@ def _exp_get(ctx: ParseCtx, tens: Tens):
     if isinstance(tens, Minus):
         return _exp_run_minus(ctx, tens)
 
+    if isinstance(tens, merge_expression.Add):
+        return _exp_run_add(ctx, tens)
+
     raise ValueError("unsupported tens", tens)
 
 
@@ -260,6 +263,12 @@ def _exp_run_minus(ctx: ParseCtx, minus: Minus):
     left = _exp_get(ctx, minus.left)
     right = _exp_get(ctx, minus.right)
     return torch.subtract(left, right)
+
+
+def _exp_run_add(ctx: ParseCtx, minus: merge_expression.Add):
+    left = _exp_get(ctx, minus.left)
+    right = _exp_get(ctx, minus.right)
+    return torch.add(left, right)
 
 
 def _exp_run_merge(ctx: ParseCtx, merge: Merge):
@@ -275,6 +284,14 @@ def _exp_run_merge(ctx: ParseCtx, merge: Merge):
     return base
 
 
+def _exp_run(ctx: ParseCtx, runexp: RunExp):
+    if isinstance(runexp.item, Merge):
+        return _exp_run_merge(ctx, runexp.item)
+    elif isinstance(runexp.item, merge_expression.Add):
+        return _exp_run_add(ctx, runexp.item)
+    raise ValueError("invalid runexp type", runexp.item)
+
+
 def merge_tensors(
         key: str, ctx: Output, configs: List, inputs: List[Input],
         tensors: List[torch.Tensor], missing_inputs: List[Input], has_floats: bool, has_non_floats: bool,
@@ -285,7 +302,7 @@ def merge_tensors(
         if len(tensors) != len(inputs):
             raise ValueError("huh", len(tensors), len(inputs))
         pctx = ParseCtx({ i.ident: t for (t, i) in zip(tensors, inputs) })
-        return _exp_run_merge(pctx, merge.merge)
+        return _exp_run(pctx, merge.merge)
 
     if isinstance(merge, BasicMerge):
         if has_non_floats or not has_floats:
@@ -551,7 +568,7 @@ def _never_used_inputs(inputs: List[Input], outputs: List[Output]) -> List[int]:
                 if factor is not SKIP_INPUT:
                     used_input_idxs.add(pos)
         elif isinstance(merge, ExpressionMerge):
-            used_vars = merge_expression.merge_vars(merge.merge)
+            used_vars = merge_expression.runexp_vars(merge.merge)
             for pos, i in enumerate(inputs):
                 if i.ident and i.ident in used_vars:
                     used_input_idxs.add(pos)
@@ -772,7 +789,7 @@ def _make_output_path(
             parts.append(p)
         full_name = "_+_".join(parts)
     elif output_arg.config[0] == "expression":
-        full_name = merge_to_str(output_arg.config[1].merge)
+        full_name = runexp_to_str(output_arg.config[1].merge, True)
         # full_name = output_arg.config[1].original_expression
         # print(full_name)
         pass
@@ -980,7 +997,7 @@ if __name__ == "__main__":
             else:
                 p = parsers[0]
 
-            merge = merge_expression.parse_merge_expression(p, expression)
+            merge = merge_expression.parse_run_expression(p, expression)
             return ExpressionMerge(merge, expression)
 
         def multi(args):
