@@ -45,6 +45,11 @@ else:
 
 from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_ema, statedict_strip_ema, _build_tensor
 
+try:
+    import tqdm
+except:
+    tqdm = None
+
 import torch
 import merge_expression
 from merge_expression import Merge, RunExp, Tens, Var, Minus, runexp_to_str
@@ -401,6 +406,7 @@ def state_dicts_merge(
         no_mixed: bool = False,
         precision: str = "auto",
         never_load_inputs: Optional[Set[int]] = None,
+        work_iter: Optional[Callable[[Iterable], Iterable]] = None,
 ) -> List[Dict]:
     state_dicts = list(state_dicts)
     never_load_inputs = never_load_inputs or []
@@ -424,6 +430,9 @@ def state_dicts_merge(
     merge_contexts = list(merge_contexts)
     new_sd_tups = [(i, { }) for i in merge_contexts]
     all_keys = sorted(all_keys)
+    if work_iter:
+        all_keys = work_iter(all_keys)
+
     for key in all_keys:
         lazy_tensors = []
         others = []
