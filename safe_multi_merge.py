@@ -21,6 +21,63 @@
 # SOFTWARE.
 #
 
+"""
+deps: torch pyparsing==3.0.*
+
+usage:
+    simple mode, single output file all merged together with weighted averaging with chosen factors:
+        (all factors will be normalized to total of 1)
+
+        ./safe_multi_merge.py single output_filepath_name.ckpt \
+        -i /model_path/mod1.ckpt 1 \
+        -i /model_path/asdf.ckpt 1 \
+        -i /model_path/test.ckpt 1 \
+        -i /model_path/long_name_whatever_123.ckpt 2
+
+        will merge into one model with weights 0.2, 0.2, 0.2, 0.4 respectively, saved as output_filepath_name.ckpt.
+
+        For auto naming just pass a directory as argument (needs to exist as directory or end with /),
+        by default uses model filename unless -I is used and custom name is given:
+
+
+        ./safe_multi_merge.py single ./target/folder/ \
+        -i /model_path/mod1.ckpt 1 \
+        -i /model_path/other.ckpt 1.5 \
+        -i /model_path/example.ckpt 2.1 \
+        -I /model_path/long_name_whatever_123.ckpt Custom_NAME 2
+
+        will be written to: ./target/folder/merged_@UTV_mod1@0.1515_+other@0.2273_+example@0.3182_+Custom_NAME@0.303.ckpt
+
+
+
+    merging with multiple outputs or complex merge expressions:
+        Only loads individual tensors lazily as needed
+        so even merging a large number of models into lots of
+        configurations should only need a few hundred MBs of RAM.
+
+          ./safe_multi_merge.py \
+          multi \
+          ./output/folder/target/ \
+          -I ./src/models/sd-v1-5.fp16.safe.ckpt SD15 \
+          -I ./src/models/sd-v1-4.fp16.safe.ckpt SD14 \
+          -I ./src/models/Anything-V3.0.fp16.safe.ckpt Any3 \
+          -I ./src/models/StudioGhibli.fp16.safe.ckpt Gibli \
+          -I ./src/models/discoElysium.fp16.safe.ckpt DisEl \
+          -I ./src/models/DreamBooth1.ckpt DB1 \
+          -I ./src/models/DreamBooth2.ckpt DB2 \
+          -I ./src/models/DreamBooth3.ckpt DB3 \
+          -e ./target/custom_name.ckpt "Any3@0.3 + (Gibli + DisEl@2)@0.5 + DB1@0.2" \  `#(Gibli + DisEl@2) will be weighted merged at 1:2 first then merged with the rest`
+          -E "SD15 < ( (DB1-SD15) + (DB2-SD14)@2 )" \     `# will subtract SD15 from DB1, then subtract SD14 from DB2, then weighted merge only the differences at 1:2 ratio, then add that to SD15 ( < means a straight add no merging)`
+          -E "Any3 + (SD15 < ((DB1-SD15) + (DB2-SD15) + (DB3-SD14)))"  \  `# get all the differences, weight merge the diffs, add to SD15, weight merge the result with Anything3`
+          -E ..... \
+          -E ..... \
+          -E .....
+
+        # -e "filename.ckpt" "expression"   # -e is with custom name as first argument
+        # -E "expression"                   # -E is auto named and saved to output folder target, must be specified with -E.
+
+"""
+
 import argparse
 import dataclasses
 import functools
@@ -34,6 +91,9 @@ import time
 import zipfile
 from pathlib import Path
 from zipfile import ZipFile
+
+if __name__ == '__main__':
+    sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from type_utils import ensure_equal
 
