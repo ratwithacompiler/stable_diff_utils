@@ -115,7 +115,8 @@ class Output():
     zip_file_file: Optional[io.FileIO] = None
     model: Optional[dict] = None
 
-    def open(self, mode: str, compression = zipfile.ZIP_STORED, compresslevel = None, with_file = False):
+    def open(self, mode: str, compression = zipfile.ZIP_STORED, compresslevel = None,
+             with_file = False, torch_writer: bool = False):
         if self.zip_file is not None or self.zip_file_file is not None:
             raise ValueError("already open", self.path, self.zip_file, self.zip_file_file)
 
@@ -125,7 +126,26 @@ class Output():
         else:
             open_arg = self.write_path
 
-        self.zip_file = ZipFile(open_arg, mode = mode, compression = compression, compresslevel = compresslevel)
+        if torch_writer:
+            zf = torch.serialization._open_zipfile_writer(open_arg)
+
+            def writestr(path: str, data: bytes):
+                if path == "archive/version":
+                    # ignore version, written by the torch writer itself, only needed with normal zipfile
+                    # print("ignoring version", data)
+                    return
+                ensure_equal(path.startswith("archive/"), True, "invalid path", path)
+                path = path[8:]
+                zf.file_like.write_record(path, data, len(data))
+
+            def close():
+                pass
+
+            zf.writestr = writestr
+            zf.close = close
+            self.zip_file = zf
+        else:
+            self.zip_file = ZipFile(open_arg, mode = mode, compression = compression, compresslevel = compresslevel)
 
     def open_buffer(self, mode: str, compression = zipfile.ZIP_STORED, compresslevel = None):
         if self.zip_file is not None:
@@ -725,6 +745,9 @@ def inputs_outputs_merge_torch_zip_stream(
     inputs = _to_inputs(inputs)
     output_writers = { id(i): _OutputWriter(i) for i in outputs }
 
+    for ow in output_writers.values():
+        ow.output.zip_file.writestr("archive/version", "3\n")
+
     def merge_tensors(key: str, maybe_tensors: List[Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
         writer: _OutputWriter = output_writers[id(ctx)]
 
@@ -784,7 +807,6 @@ def inputs_outputs_merge_torch_zip_stream(
         pickler.dump(model)
         data = io_buffer.getvalue()
         writer.output.zip_file.writestr("archive/data.pkl", data)
-        writer.output.zip_file.writestr("archive/version", "3\n")
 
 
 def ensure_unique(items, key = None, ignored_keys: Optional[Set] = None):
@@ -1002,7 +1024,7 @@ def main(
 
         i.write_path = write_path
         print(f"opening merge output file {write_path!r}, merge: {[(a.name, a.merger) for a in i.mergers]}")
-        i.open(mode, with_file = True)
+        i.open(mode, with_file = True, torch_writer = True)
 
     start = time.monotonic()
     inputs_outputs_merge_torch_zip_stream(inputs, outputs, merge_tensors, precision = precision)
