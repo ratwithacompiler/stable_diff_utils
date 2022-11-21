@@ -290,7 +290,6 @@ def runexp_vars(runexp: RunExp) -> Set[str]:
 
 
 def parse_run_expression(parser, expression: str) -> RunExp:
-    print("huh", repr(expression))
     full = parser.parse_string(expression, parse_all = True)
     ensure_equal(len(full), 1)
     exp = full[0]
