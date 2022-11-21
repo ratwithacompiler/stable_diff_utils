@@ -966,8 +966,11 @@ def main(
                 name_original_expression, name_relative_factors,
             )
 
-        if not overwrite and os.path.exists(i.path):
-            raise ValueError(f"output_file path exists already, overwriting disabled {i.path!r}")
+        if os.path.exists(i.path):
+            if os.path.isdir(i.path):
+                raise ValueError("expected file path, got dir", i.path)
+            if not overwrite:
+                raise ValueError(f"output_file path exists already, overwriting disabled {i.path!r}")
 
         if i.config[0] == "basic":
             if len(i.config[1].factors) != len(inputs):
@@ -1027,8 +1030,12 @@ def main(
 
         output_path = i.path
         if use_tmpfile:
-            if not overwrite and os.path.exists(output_path):
-                raise ValueError(f"output_file path exists, didn't before, overwriting disabled {output_path!r}")
+            if os.path.exists(output_path):
+                if os.path.isdir(output_path):
+                    raise ValueError("expected file path, got dir", output_path)
+                if not overwrite:
+                    raise ValueError(f"output_file path exists already, overwriting disabled {output_path!r}")
+
             assert i.write_path is not None
             assert i.write_path != output_path
             os.rename(i.write_path, output_path)
@@ -1058,7 +1065,12 @@ if __name__ == "__main__":
             inputs = [i[1] for i in tups_all]
 
             # if os.path.isdir(args.output_file_or_dir):
-            if args.output_file_or_dir and args.output_file_or_dir[-1] in ("/", "\\"):
+            if (args.output_file_or_dir
+                    and (
+                            args.output_file_or_dir[-1] in ("/", "\\")  # ends with / or \
+                            or os.path.isdir(args.output_file_or_dir)  # or is an existing dir
+                    )
+            ):
                 # is a dir, auto named later into output_dir
                 output_dir = args.output_file_or_dir
                 outputs = [OutputArg(None, ("basic", BasicMerge(factors)))]
