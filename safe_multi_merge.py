@@ -483,13 +483,13 @@ def state_dicts_merge(
 
         # print(key, lazy_tensors)
         if has_floats:
-            tensors = [(i.load_copy() if i is not None else None) for i in lazy_tensors]
-        else:
             tensors = [(i.load_copy().to(use_precision) if i is not None else None) for i in lazy_tensors]
+        else:
+            tensors = [(i.load_copy() if i is not None else None) for i in lazy_tensors]
 
         sizes = { i.storage().nbytes() for i in tensors if i is not None }
         if len(sizes) > 1:
-            raise ValueError("tensors of various sizes, can't merge", key, sizes)
+            raise ValueError("tensors of various sizes, can't merge", key, sizes, dtypes, is_mixed)
 
         for merge_ctx, new_sd in new_sd_tups:
             new_sd[key] = merge_tensors_fn(key, tensors, merge_ctx, bool(has_floats), is_mixed)
