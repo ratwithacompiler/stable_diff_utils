@@ -668,40 +668,33 @@ def inputs_outputs_merge_in_memory(
     return new_sds
 
 
-def _create_persistent_id_fns():
-    # Creates a torch _save persistent_id function for pickling torch Tensors.
-    # Each torch persistent_id function has its own local incrementing counter
-    # used for tensor storage key generation.
-
-    import torch.serialization
-    if torch.serialization.DEFAULT_PROTOCOL != 2:
-        raise ValueError("expected torch.serialization.DEFAULT_PROTOCOL == 2, got ", torch.serialization.DEFAULT_PROTOCOL)
-
-    class FoundException(Exception):
-        def __init__(self, persistent_id):
-            self.persistent_id = persistent_id
-
-    class CatchingPickler():
-        def __init__(self, data, protocol = None):
-            pass
-
-        def __setattr__(self, key, value):
-            if value != "ignore":
-                raise FoundException(value)
-
-    class PickleModule():
-        Pickler = CatchingPickler
-
-    try:
-        torch.serialization._save(None, None, PickleModule, 2)
-    except FoundException as ex:
-        return ex.persistent_id
-
-
 class _OutputWriter():
     def __init__(self, output: Output):
         self.output = output
-        self.persistent_id = _create_persistent_id_fns()
+        self.persistent_id_pos = -1
+        self.dtype_classes = { }
+        for key, val in vars(torch).items():
+            if (
+                    key and key[0].isupper()
+                    and key.endswith("Storage")
+                    and isinstance(val, type)
+                    and issubclass(val, torch.storage._LegacyStorage)
+            ):
+                self.dtype_classes[val.dtype] = val
+
+    def persistent_id(self, tensor: torch.Tensor):
+        self.persistent_id_pos += 1
+        pos = self.persistent_id_pos
+
+        storage = tensor.storage()
+        if isinstance(storage, torch.storage._TypedStorage):
+            type_str = self.dtype_classes[storage.dtype]
+            bytes_len = storage.size()
+        else:
+            type_str = torch.serialization.normalize_storage_type(type(tensor))
+            bytes_len = storage.nbytes()
+
+        return "storage", type_str, str(pos), "cpu", bytes_len
 
 
 def inputs_outputs_merge_torch_zip_stream(
@@ -741,7 +734,7 @@ def inputs_outputs_merge_torch_zip_stream(
             tensor = merge_fn(key, ctx, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
 
         # create fake classes that pickle serialize like torch.Tensor
-        pers_id_tup = writer.persistent_id(tensor.storage())
+        pers_id_tup = writer.persistent_id(tensor)
         if pers_id_tup[0] != "storage":
             raise ValueError("expected storage as persistent id 0", pers_id_tup[0])
         storage_key = pers_id_tup[2]
