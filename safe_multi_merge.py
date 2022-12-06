@@ -86,6 +86,7 @@ import itertools
 import logging
 import logging as _logging
 import os
+import re
 import sys
 import time
 import zipfile
@@ -954,6 +955,7 @@ def _make_output_path(
         merge_text_encoder: Optional[bool] = None,
         merge_vae_encoder: Optional[bool] = None,
         add_parent_dirnames: Optional[int] = None,
+        check_add_inpaint: bool = False,
         prefix: Optional[str] = None,
         extension: Optional[str] = None,
         original_expression: bool = False,
@@ -1016,7 +1018,17 @@ def _make_output_path(
         settings = "@" + "".join(flags) + "_"
 
     full_name = (prefix or "") + settings + full_name
+    extension = (extension or "").lstrip(".")
+
+    # has_inpaint = False
+    if check_add_inpaint:
+        reg = re.compile("-inpainting(\.[\w]+)?")
+        has_inpaint = any(reg.search(i.path) for i in inputs)
+        if has_inpaint:
+            extension = "-inpainting." + extension
+
     if extension:
+        # if not has_inpaint and not extension.startswith("."):
         if not extension.startswith("."):
             extension = "." + extension
         full_name = full_name + extension
@@ -1058,7 +1070,7 @@ def _config_merge_fns(merger, fallback, merge_unet: bool, merge_text_encoder: bo
 def main(
         inputs: List[Input], output_args: List[OutputArg], output_dir: Optional[str],
         overwrite: bool, precision: str, extended: bool, add_parent_dirs: Optional[int],
-        name_prefix: Optional[str], extension: Optional[str],
+        name_prefix: Optional[str], extension: Optional[str], inpaint_allowed: bool,
         name_original_expression: bool, name_relative_factors: bool,
         merge_unet: bool, merge_text_encoder: bool, merge_vae_encoder: bool,
         missing_key_fallback: bool,
@@ -1088,7 +1100,7 @@ def main(
             i.path = _make_output_path(
                 inputs, i, output_dir,
                 merge_unet, merge_text_encoder, merge_vae_encoder,
-                add_parent_dirs, name_prefix, extension,
+                add_parent_dirs, inpaint_allowed, name_prefix, extension,
                 name_original_expression, name_relative_factors,
             )
 
@@ -1127,7 +1139,7 @@ def main(
             print("stripping ema model keys")
             statedict_strip_ema(sd, True)
 
-    settings = Settings(True)
+    settings = Settings(inpaint_allowed and False)
     merge_fn = functools.partial(merge_tensors, settings)
     # configs = [_config_merge_fns(i.config[1], _merge_use_first, merge_unet, merge_text_encoder, merge_vae_encoder) for i in output_args]
     # res = inputs_outputs_merge_in_memory(inputs, configs, merge_fn, precision = precision)
@@ -1252,6 +1264,8 @@ if __name__ == "__main__":
         parser.add_argument("-V", "--no-merge-vae", action = "store_true")
         parser.add_argument("-U", "--no-merge-unet", action = "store_true")
 
+        parser.add_argument("-I", "--no-inpaint", action = "store_true")
+
         parser.add_argument("-p", "--precision", choices = ["auto", "fp16", "fp32"], default = "auto",
                             help = '"auto" uses "fp32" if any of the tensors are fp32 otherwise uses "fp16"')
 
@@ -1309,7 +1323,7 @@ if __name__ == "__main__":
         main(
             inputs, outputs, output_dir,
             args.overwrite, args.precision, not args.simple, args.parent_dirs,
-            args.name_prefix, args.name_ext,
+            args.name_prefix, args.name_ext, not args.no_inpaint,
             args.name_original_expression, not args.name_original_factors,
             not args.no_merge_unet, not args.no_merge_text_encoder, not args.no_merge_vae,
             args.missing_key_first_fallback,
