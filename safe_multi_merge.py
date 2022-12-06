@@ -95,7 +95,7 @@ from zipfile import ZipFile
 if __name__ == '__main__':
     sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from type_utils import ensure_equal
+from type_utils import ensure_equal, ensure
 
 if sys.version_info[:2] >= (3, 9):
     from typing import Union, Optional, Any, TypeVar, List, Dict, Tuple
@@ -336,9 +336,15 @@ class _MissingTensorError(Exception):
 
 
 @dataclasses.dataclass()
+class Settings():
+    merge_inpainting: bool
+
+
+@dataclasses.dataclass()
 class ParseCtx():
     var_map: Dict
     key: str
+    merge_inpainting: bool
 
 
 class ModelKeyError(KeyError):
@@ -379,15 +385,75 @@ def _exp_run_add(ctx: ParseCtx, minus: merge_expression.Add):
     return torch.add(left, right)
 
 
+INPAINT_INPUT_KEY = "model.diffusion_model.input_blocks.0.0.weight"
+
+
+def _exp_run_merge_inpaint(ctx: ParseCtx, merge: Merge):
+    # merging inpainting with non-inpainting, shapes [320, 4, 3, 3] or [320, 9, 3, 3]
+    # merges all normal layers according to factors,
+    # and all extra inpainting layers according to same factors but full ignoring any without
+    # as if they didn't exist.
+    # So [Norm, Norm, Inp, Inp] would merge as [0.25,0.25,0.25,0.25] for the first 4 layers
+    # and [0.5, 0.5] for the inpainting layers.
+
+    normal_shape = [320, 4, 3, 3]
+    inpaint_shape = [320, 9, 3, 3]
+
+    tensors_factors = [(_exp_get(ctx, i.item), i.factor) for i in merge.items]
+    for tens, _fact in tensors_factors:
+        ensure(list(tens.shape) in (normal_shape, inpaint_shape))
+
+    # merge everything of :4 normal layers as usual
+    factor_total = merge.factor_total()
+    base = tensors_factors[0][0].clone() * (tensors_factors[0][1] / factor_total)
+    for tens, fact in tensors_factors[1:]:
+        tens = tens.clone()
+        base[:, :4, :, :] += tens[:, :4, :, :] * (fact / factor_total)
+
+    inp_tensors = [(tens, fact) for (tens, fact) in tensors_factors if tens.shape[1] == 9]
+    ensure(inp_tensors)
+
+    # merge 5:9 for all that have the inpaint layers
+    if len(inp_tensors) == 1:
+        # just one inpaint one, keeping the 5:9 from that one as is,
+        # overwrite rest with already fully merged base
+        inp_tens = inp_tensors[0][0].clone()
+        inp_tens[:, :4, :, :] = base[:, :4, :, :]
+        return inp_tens
+
+    # multiple with inpaint layers, merge all those
+    factor_total = sum(fact for (_t, fact) in inp_tensors)
+    inp_base = inp_tensors[0][0].clone() * (inp_tensors[0][1] / factor_total)
+    for tens, fact in inp_tensors[1:]:
+        inp_base[:, 4:, :, :] += tens[:, 4:, :, :] * (fact / factor_total)
+
+    # copy already merged base to one with 9 inpaint shape
+    inp_base[:, :4, :, :] = base[:, :4, :, :]
+    return inp_base
+
+
 def _exp_run_merge(ctx: ParseCtx, merge: Merge):
     factor_total = merge.factor_total()
-
     fact = merge.items[0].factor / factor_total
     base = _exp_get(ctx, merge.items[0].item) * fact
     for i in merge.items[1:]:
         tens = _exp_get(ctx, i.item)
         fact = i.factor / factor_total
-        base += tens * fact
+        try:
+            base += tens * fact
+        except RuntimeError:
+            if (
+                    ctx.merge_inpainting
+                    and ctx.key == INPAINT_INPUT_KEY
+                    and base.shape != tens.shape
+                    and len(base.shape) == 4
+                    and len(tens.shape) == 4
+                    and base.shape[0] == tens.shape[0]
+                    and base.shape[2:] == tens.shape[2:]
+                    and (base.shape[1], tens.shape[1]) in [(4, 9), (9, 4)]
+            ):
+                return _exp_run_merge_inpaint(ctx, merge)
+            raise
 
     return base
 
@@ -401,16 +467,16 @@ def _exp_run(ctx: ParseCtx, runexp: RunExp):
 
 
 def merge_tensors(
-        key: str, ctx: Output, configs: List, inputs: List[Input],
+        conf: Settings, key: str, output: Output, configs: List, inputs: List[Input],
         tensors: List[torch.Tensor], missing_inputs: List[Input], has_floats: bool, has_non_floats: bool,
 ) -> torch.Tensor:
-    merge = ctx.key_merge(key)
+    merge = output.key_merge(key)
 
     try:
         if isinstance(merge, ExpressionMerge):
             if len(tensors) != len(inputs):
                 raise ValueError("huh", len(tensors), len(inputs))
-            pctx = ParseCtx({ i.ident: t for (t, i) in zip(tensors, inputs) }, key)
+            pctx = ParseCtx({ i.ident: t for (t, i) in zip(tensors, inputs) }, key, conf.merge_inpainting)
             return _exp_run(pctx, merge.merge)
 
         if isinstance(merge, BasicMerge):
@@ -418,15 +484,15 @@ def merge_tensors(
                 raise ValueError(f"invalid tensors", key, has_floats, has_non_floats, tensors)
             if missing_inputs:
                 raise _MissingTensorError(f"missing tensors", key, missing_inputs)
-            return merge_weighted(ctx, tensors, configs)
+            return merge_weighted(output, tensors, configs)
 
         if callable(merge):
-            return merge(ctx, tensors, configs)
+            return merge(output, tensors, configs)
     except ModelKeyError as ex:
         logger.warning("model missing required, using fallback choice fn: %s, key: %r, model: %r",
-                       ctx.missing_key_fallback_fn, key, ex.model_name)
-        if ctx.missing_key_fallback_fn is not None:
-            return ctx.missing_key_fallback_fn(ctx, tensors, configs)
+                       output.missing_key_fallback_fn, key, ex.model_name)
+        if output.missing_key_fallback_fn is not None:
+            return output.missing_key_fallback_fn(output, tensors, configs)
         raise
 
         # return i.merger(key, ctx, configs, inputs, tensors, missing_inputs, has_floats, has_non_floats)
@@ -547,9 +613,9 @@ def state_dicts_merge(
         else:
             tensors = [(i.load_copy() if i is not None else None) for i in lazy_tensors]
 
-        sizes = { i.storage().nbytes() for i in tensors if i is not None }
-        if len(sizes) > 1:
-            raise ValueError("tensors of various sizes, can't merge", key, sizes, dtypes, is_mixed)
+        # sizes = { i.storage().nbytes() for i in tensors if i is not None }
+        # if len(sizes) > 1:
+        #     raise ValueError("tensors of various sizes, can't merge", key, sizes, dtypes, is_mixed)
 
         for merge_ctx, new_sd in new_sd_tups:
             new_sd[key] = merge_tensors_fn(key, tensors, merge_ctx, bool(has_floats), is_mixed)
@@ -1061,8 +1127,10 @@ def main(
             print("stripping ema model keys")
             statedict_strip_ema(sd, True)
 
+    settings = Settings(True)
+    merge_fn = functools.partial(merge_tensors, settings)
     # configs = [_config_merge_fns(i.config[1], _merge_use_first, merge_unet, merge_text_encoder, merge_vae_encoder) for i in output_args]
-    # res = inputs_outputs_merge_in_memory(inputs, configs, merge_tensors, precision = precision)
+    # res = inputs_outputs_merge_in_memory(inputs, configs, merge_fn, precision = precision)
     # print(len(res))
     # exit()
 
@@ -1082,7 +1150,7 @@ def main(
         i.open(mode, with_file = True, torch_writer = True)
 
     start = time.monotonic()
-    inputs_outputs_merge_torch_zip_stream(inputs, outputs, merge_tensors, precision = precision)
+    inputs_outputs_merge_torch_zip_stream(inputs, outputs, merge_fn, precision = precision)
     end = time.monotonic()
     diff = end - start
     for i in outputs:
