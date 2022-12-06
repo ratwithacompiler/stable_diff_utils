@@ -1139,7 +1139,7 @@ def main(
             print("stripping ema model keys")
             statedict_strip_ema(sd, True)
 
-    settings = Settings(inpaint_allowed and False)
+    settings = Settings(inpaint_allowed)
     merge_fn = functools.partial(merge_tensors, settings)
     # configs = [_config_merge_fns(i.config[1], _merge_use_first, merge_unet, merge_text_encoder, merge_vae_encoder) for i in output_args]
     # res = inputs_outputs_merge_in_memory(inputs, configs, merge_fn, precision = precision)
