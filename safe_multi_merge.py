@@ -104,7 +104,12 @@ if sys.version_info[:2] >= (3, 9):
 else:
     from typing import Dict, List, Tuple, Set, Union, Optional, Iterable, Type, Callable, Any, Generator, TypeVar
 
-from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_ema, statedict_strip_ema, _build_tensor
+from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_ema, statedict_strip_ema, _build_tensor, _guess_filetype
+
+try:
+    import safetensors
+except:
+    safetensors = None
 
 try:
     import tqdm
@@ -127,6 +132,11 @@ class Input():
     ident: Optional[str]
     zip_file: Optional[ZipFile] = None
     model: Optional[dict] = None
+    filetype: Optional[str] = None
+
+    def ensure_exists(self):
+        if not os.path.isfile(self.path):
+            raise FileNotFoundError(self.path)
 
     def open(self):
         if self.zip_file is not None:
@@ -235,8 +245,47 @@ class Output():
             return [None for _ in range(inputs_cnt)]
 
 
-@dataclasses.dataclass()
 class LazyTensor():
+    def load(self, reload = False, dtype = None):
+        raise NotImplementedError()
+
+    def dtype(self):
+        raise NotImplementedError()
+
+    def unload(self):
+        raise NotImplementedError()
+
+    def load_copy(self):
+        raise NotImplementedError()
+
+
+@dataclasses.dataclass()
+class SafetensorsLazyTensor(LazyTensor):
+    safe_tensor: Any
+    safe_tensor_root: Any
+    safe_tensor_key: Any
+
+    def load(self, reload = False, dtype = None):
+        pass
+
+    def dtype(self):
+        st = self.safe_tensor
+        if st is None:
+            st = self.safe_tensor_root.get_tensor(self.safe_tensor_key)
+        return st.dtype
+
+    def unload(self):
+        pass
+
+    def load_copy(self):
+        st = self.safe_tensor
+        if st is None:
+            st = self.safe_tensor_root.get_tensor(self.safe_tensor_key)
+        return st.detach().clone()
+
+
+@dataclasses.dataclass()
+class TorchLazyTensor(LazyTensor):
     _ctx: Any
     _zip_file: ZipFile
     _storage_tup: tuple
@@ -286,7 +335,7 @@ def _build_lazy_tensor(ctx, zipfile: ZipFile, storage_tup, storage_offset, size,
         raise ValueError("read unexpected amount of bytes",
                          data_size, expected_size, data_path, element_count, dtype_size)
 
-    return LazyTensor(ctx, zipfile, storage_tup, data_path, storage_offset, torch.Size(size), stride, requires_grad)
+    return TorchLazyTensor(ctx, zipfile, storage_tup, data_path, storage_offset, torch.Size(size), stride, requires_grad)
 
 
 def torch_safe_load_dict_lazy(model_path_or_zipfile: Union[str, ZipFile], extended: bool = False, tensor_ctx = None):
@@ -1070,6 +1119,23 @@ def _config_merge_fns(merger, fallback, merge_unet: bool, merge_text_encoder: bo
     return configs
 
 
+def _safetensors_load_lazy(path: str, very_lazy: bool) -> dict:
+    if safetensors is None:
+        raise ValueError("_safetensors_load_lazy but safetensors not installed")
+
+    safe_tens = safetensors.safe_open(path, framework = "pt", device = "cpu")
+    sd = { }
+    for k in safe_tens.keys():
+        if very_lazy:
+            sd[k] = SafetensorsLazyTensor(None, safe_tens, k)
+        else:
+            sd[k] = SafetensorsLazyTensor(safe_tens.get_tensor(k), safe_tens, k)
+
+    return {
+        "state_dict": sd
+    }
+
+
 def main(
         inputs: List[Input], output_args: List[OutputArg], output_dir: Optional[str],
         overwrite: bool, precision: str, extended: bool, add_parent_dirs: Optional[int],
@@ -1128,11 +1194,21 @@ def main(
     ensure_unique(outputs, key = lambda out: out.path, ignored_keys = { "/dev/null" })
 
     for i in inputs:
-        i.open()
+        i.ensure_exists()
 
     for i in inputs:
-        i.model = model = torch_safe_load_dict_lazy(i.zip_file, extended)
-        sd = model["state_dict"]
+        filetype = _guess_filetype(i.path, "ckpt")
+        i.filetype = filetype
+        print(f"loading {filetype} from {i.path!r}")
+        if filetype == "ckpt":
+            i.open()
+            i.model = torch_safe_load_dict_lazy(i.zip_file, extended)
+        elif filetype == "safetensors":
+            i.model = _safetensors_load_lazy(i.path, True)
+        else:
+            raise ValueError("invalid filetype", filetype)
+
+        sd = i.state_dict()
 
         if ema_rename_require:
             print("replacing model keys with required ema model keys")

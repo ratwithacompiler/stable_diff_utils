@@ -41,6 +41,11 @@ import pickletools
 
 import logging as _logging
 
+try:
+    import safetensors.torch
+except:
+    safetensors = None
+
 logger = _logging.getLogger(__name__)
 
 
@@ -380,9 +385,20 @@ def torch_safe_load_dict(model_path_or_zipfile: Union[str, zipfile.ZipFile], ext
     return model
 
 
+def _guess_filetype(path: str, default):
+    path = str(path)
+    if path.endswith(".safetensor") or path.endswith(".safetensors") or path.endswith(".st"):
+        return "safetensors"
+
+    if path.endswith(".pt") or path.endswith(".ckpt"):
+        return "ckpt"
+
+    return default
+
+
 def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool,
          ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
-         set_times: bool, use_tmpfile: bool):
+         set_times: bool, use_tmpfile: bool, fixed_write_filetype: str):
     if not overwrite and os.path.exists(output_path):
         raise ValueError(f"output_file path exists already, overwriting disabled {output_path!r}")
 
@@ -414,17 +430,24 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
 
     model = { "state_dict": sd }
 
+    filetype = fixed_write_filetype or _guess_filetype(output_path, "ckpt")
+
     if use_tmpfile:
         write_path = f"{output_path}.tmp"
         mode = "wb"
-        print(f"writing to tmp file {write_path!r}")
+        print(f"writing to tmp file {write_path!r} as {filetype}")
     else:
         write_path = output_path
         mode = "wb" if overwrite else "xb"
-        print(f"writing to {output_path!r}, overwrite={overwrite}")
+        print(f"writing to {output_path!r} as {filetype}, overwrite={overwrite}")
 
-    with open(write_path, mode) as out_file:
-        torch.save(model, out_file)
+    if filetype == "ckpt":
+        with open(write_path, mode) as out_file:
+            torch.save(model, out_file)
+    elif filetype == "safetensors":
+        safetensors.torch.save_file(model["state_dict"], write_path)
+    else:
+        raise ValueError("invalid filetype", filetype)
 
     if use_tmpfile:
         if not overwrite and os.path.exists(output_path):
@@ -449,6 +472,10 @@ if __name__ == "__main__":
         parser.add_argument("-o", "--overwrite", action = "store_true")
         parser.add_argument("-H", "--half", action = "store_true")
 
+        format_group = parser.add_mutually_exclusive_group()
+        format_group.add_argument("-C", "--write-ckpt", action = "store_true")
+        format_group.add_argument("-S", "--write-safetensors", action = "store_true")
+
         parser.add_argument("-e", "--ema-rename-try", action = "store_true", help = "if ema keys present replace normal model keys with ema equivalent, ema keys not kept separately")
         parser.add_argument("--ema-rename", action = "store_true", help = "replace normal model keys with ema equivalent, ema keys not kept separately, require ema keys")
         parser.add_argument("-E", "--ema-strip", action = "store_true", help = "strip ema model keys")
@@ -459,8 +486,15 @@ if __name__ == "__main__":
         # parser.add_argument("-S", "--strip", choices = ["ema", "non_ema"])
         args = parser.parse_args()
         _logging.basicConfig(level = _logging.DEBUG)
+
+        fixed_write_filetype = None
+        if args.write_ckpt:
+            fixed_write_filetype = "ckpt"
+        if args.write_safetensors:
+            fixed_write_filetype = "safetensors"
+
         main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple, args.ema_rename, args.ema_rename_try, args.ema_strip,
-             args.times, not args.no_tempfile)
+             args.times, not args.no_tempfile, fixed_write_filetype)
 
 
     setup()

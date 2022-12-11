@@ -39,7 +39,7 @@ import time
 if __name__ == '__main__':
     sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from safe_load import statedict_convert_ema, statedict_strip_ema
+from safe_load import statedict_convert_ema, statedict_strip_ema, _guess_filetype
 from safe_multi_merge import torch_safe_load_dict_lazy, _precision_arg, LazyTensor
 
 if sys.version_info[:2] >= (3, 9):
@@ -47,6 +47,11 @@ if sys.version_info[:2] >= (3, 9):
     from collections.abc import Iterable, Callable, Generator, AsyncGenerator, Collection, Set
 else:
     from typing import Dict, List, Tuple, Set, Union, Optional, Iterable, Type, Callable, Any, Generator, TypeVar
+
+try:
+    import safetensors.torch
+except:
+    safetensors = None
 
 import torch
 
@@ -136,20 +141,31 @@ def main(
         path1: str, path2: str,
         use_unsafe_torch_load: bool,
         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
+        suggested_filetype: Optional[str],
 ):
     for i in (path1, path2):
         if not os.path.exists(i):
             raise FileNotFoundError(i)
 
     print(f"diffing {path1!r} - {path2!r}")
-    if use_unsafe_torch_load:
-        model1 = torch.load(path1)
-        model2 = torch.load(path2)
-    else:
-        model1 = torch_safe_load_dict_lazy(path1, extended = True)
-        model2 = torch_safe_load_dict_lazy(path2, extended = True)
+    models = []
+    for path in [path1, path2]:
+        filetype = _guess_filetype(path, suggested_filetype)
+        if filetype == "ckpt":
+            if use_unsafe_torch_load:
+                model = torch.load(path)
+            else:
+                model = torch_safe_load_dict_lazy(path, extended = True)
+        elif filetype == "safetensors":
+            sd = safetensors.torch.load_file(path)
+            model = { "state_dict": sd }
+            del sd
+        else:
+            raise ValueError("invalid filetype", filetype)
+        models.append(model)
+        del model
 
-    for mod in [model1, model2]:
+    for mod in models:
         sd = mod["state_dict"]
 
         if ema_rename_require:
@@ -163,6 +179,8 @@ def main(
             print("stripping ema model keys")
             statedict_strip_ema(sd, True)
         del sd
+
+    model1, model2 = models
 
     # sum_cnt = 0
     # sums = torch.zeros(1024 * 64, dtype = torch.float64)
@@ -209,14 +227,26 @@ if __name__ == "__main__":
                             help = "replace normal model keys with ema equivalent, ema keys not kept separately, require ema keys")
         parser.add_argument("-E", "--ema-strip", action = "store_true",
                             help = "strip ema model keys")
+
+        format_group = parser.add_mutually_exclusive_group()
+        format_group.add_argument("-C", "--load-ckpt", action = "store_true", help = "assume ckpt file for unknown extensions")
+        format_group.add_argument("-S", "--load-safetensors", action = "store_true", help = "assume safetensor file for unknown extensions")
+
         parser.add_argument("ckpt_1")
         parser.add_argument("ckpt_2")
         args = parser.parse_args()
         _logging.basicConfig(level = _logging.DEBUG)
 
+        suggested_filetype = None
+        if args.load_ckpt:
+            suggested_filetype = "ckpt"
+        if args.load_safetensors:
+            suggested_filetype = "safetensors"
+
         main(
             args.ckpt_1, args.ckpt_2, args.use_unsafe_torch_load,
             args.ema_rename, args.ema_rename_try, args.ema_strip,
+            suggested_filetype,
         )
 
 
