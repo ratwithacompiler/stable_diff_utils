@@ -454,7 +454,7 @@ if __name__ == "__main__":
         parser.add_argument("-E", "--ema-strip", action = "store_true", help = "strip ema model keys")
         parser.add_argument("-t", "--times", action = "store_true", help = "set same access/modified time on output file as on input file")
 
-        parser.add_argument("-T", "--no-tempfile", action = "store_true", help = "write to output file directly, don't use tempfile and rename")
+        parser.add_argument("-N", "--no-tempfile", action = "store_true", help = "write to output file directly, don't use tempfile and rename")
 
         # parser.add_argument("-S", "--strip", choices = ["ema", "non_ema"])
         args = parser.parse_args()
