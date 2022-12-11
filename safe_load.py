@@ -388,7 +388,14 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
 
     print(f"loading {input_path!r}")
     model = torch_safe_load_dict(input_path, extended)
-    sd = model["state_dict"]
+    try:
+        sd = model["state_dict"]
+    except:
+        if "model.diffusion_model.input_blocks.0.0.weight" in model:
+            print("loaded direct state_dict")
+            sd = model
+        else:
+            raise
 
     if half:
         print("halfing")
