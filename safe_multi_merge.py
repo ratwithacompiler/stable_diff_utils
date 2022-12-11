@@ -950,7 +950,8 @@ def _cleaned_name(name: str):
 
 
 def _make_output_path(
-        inputs: List[Input], output_arg: OutputArg, output_dir: Optional[str],
+        inputs: List[Input], output_arg: OutputArg, output: Output,
+        output_dir: Optional[str],
         merge_unet: Optional[bool] = None,
         merge_text_encoder: Optional[bool] = None,
         merge_vae_encoder: Optional[bool] = None,
@@ -1022,8 +1023,10 @@ def _make_output_path(
 
     # has_inpaint = False
     if check_add_inpaint:
+        unused_input_idxs = set(_never_used_inputs(inputs, [output]))
+
         reg = re.compile("-inpainting(\.[\w]+)?")
-        has_inpaint = any(reg.search(i.path) for i in inputs)
+        has_inpaint = any(reg.search(i.path) for pos, i in enumerate(inputs) if pos not in unused_input_idxs)
         if has_inpaint:
             extension = "-inpainting." + extension
 
@@ -1036,7 +1039,7 @@ def _make_output_path(
     if output_dir:
         return os.path.join(output_dir, full_name)
 
-    print("full_name", full_name)
+    # print("full_name", full_name)
     return full_name
 
 
@@ -1093,12 +1096,15 @@ def main(
     fallback_fn = _merge_use_first if missing_key_fallback else None
     outputs = []
     for i in output_args:
+        configs = _config_merge_fns(i.config[1], _merge_use_first, merge_unet, merge_text_encoder, merge_vae_encoder)
+        output = Output(None, configs, fallback_fn)
+
         if i.path is None:
             if output_dir is None:
                 raise ValueError("no name/path given for output and not output_dir, can't create name/path")
 
             i.path = _make_output_path(
-                inputs, i, output_dir,
+                inputs, i, output, output_dir,
                 merge_unet, merge_text_encoder, merge_vae_encoder,
                 add_parent_dirs, inpaint_allowed, name_prefix, extension,
                 name_original_expression, name_relative_factors,
@@ -1117,8 +1123,8 @@ def main(
                     i.config[1]
                 )
 
-        configs = _config_merge_fns(i.config[1], _merge_use_first, merge_unet, merge_text_encoder, merge_vae_encoder)
-        outputs.append(Output(i.path, configs, fallback_fn))
+        output.path = i.path
+        outputs.append(output)
     ensure_unique(outputs, key = lambda out: out.path, ignored_keys = { "/dev/null" })
 
     for i in inputs:
