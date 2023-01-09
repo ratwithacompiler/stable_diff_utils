@@ -403,7 +403,21 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
         raise ValueError(f"output_file path exists already, overwriting disabled {output_path!r}")
 
     print(f"loading {input_path!r}")
-    model = torch_safe_load_dict(input_path, extended)
+
+    filetype = _guess_filetype(input_path, "ckpt")
+    if filetype == "ckpt":
+        model = torch_safe_load_dict(input_path, extended)
+    elif filetype == "safetensors":
+        sd = safetensors.torch.load_file(input_path)
+        # if "state_dict" in sd:
+        #     model = sd
+        # else:
+        #     model = { "state_dict": sd }
+        model = { "state_dict": sd }
+        del sd
+    else:
+        raise ValueError("invalid filetype", filetype)
+
     try:
         sd = model["state_dict"]
     except:
