@@ -473,8 +473,10 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
     if use_tmpfile:
         if not overwrite and os.path.exists(output_path):
             raise ValueError(f"output_file path exists, didn't before, overwriting disabled {output_path!r}")
+
         assert write_path != output_path
         os.rename(write_path, output_path)
+        print(f"moved to to {output_path!r}")
 
     if set_times:
         cur = os.stat(input_path)
