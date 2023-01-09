@@ -142,6 +142,7 @@ def main(
         use_unsafe_torch_load: bool,
         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
         suggested_filetype: Optional[str],
+        unique_keys: bool, data_comp: bool,
 ):
     for i in (path1, path2):
         if not os.path.exists(i):
@@ -194,8 +195,23 @@ def main(
         sums.append(sum.item())
         pass
 
+    sd1 = model1["state_dict"]
+    sd2 = model2["state_dict"]
+
+    if unique_keys:
+        only_in_1 = sd1.keys() - sd2.keys()
+        if only_in_1:
+            print("only in 1:", sorted(only_in_1))
+
+        only_in_2 = sd2.keys() - sd1.keys()
+        if only_in_2:
+            print("only in 2:", sorted(only_in_2))
+
+    if not data_comp:
+        return
+
     with timed("diffing took {secs:.2f} secs ({mins:.2f} mins)"):
-        state_dict_diff(model1["state_dict"], model2["state_dict"], tens_diff, False, False)
+        state_dict_diff(sd1, sd2, tens_diff, False, False)
 
     tsums = torch.tensor(sums)
     tsums_abs = torch.abs(tsums)
@@ -221,6 +237,8 @@ if __name__ == "__main__":
     def setup():
         parser = argparse.ArgumentParser()
         parser.add_argument("--use-unsafe-torch-load", action = "store_true")
+        parser.add_argument("-u", "--unique-keys", action = "store_true")
+        parser.add_argument("-N", "--no-data-comp", action = "store_true")
         parser.add_argument("-e", "--ema-rename-try", action = "store_true",
                             help = "if ema keys present replace normal model keys with ema equivalent, ema keys not kept separately")
         parser.add_argument("--ema-rename", action = "store_true",
@@ -246,7 +264,7 @@ if __name__ == "__main__":
         main(
             args.ckpt_1, args.ckpt_2, args.use_unsafe_torch_load,
             args.ema_rename, args.ema_rename_try, args.ema_strip,
-            suggested_filetype,
+            suggested_filetype, args.unique_keys, not args.no_data_comp,
         )
 
 
