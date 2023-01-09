@@ -459,7 +459,14 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
         with open(write_path, mode) as out_file:
             torch.save(model, out_file)
     elif filetype == "safetensors":
-        safetensors.torch.save_file(model["state_dict"], write_path)
+        # non_tens = { k: v for (k, v) in sd.items() if not isinstance(v, torch.Tensor) }
+        # print("non_tens", non_tens.keys(), non_tens)
+        sd = model.get("state_dict") or model
+        if "state_dict" in sd and sd["state_dict"] == { }:
+            print("fixed removed empty {} state_dict inside state_dict")
+            del sd["state_dict"]
+
+        safetensors.torch.save_file(sd, write_path)
     else:
         raise ValueError("invalid filetype", filetype)
 
