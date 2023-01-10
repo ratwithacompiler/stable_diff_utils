@@ -342,7 +342,7 @@ DTYPE_MAP = {
 }
 
 
-def _build_tensor(zipfile, storage, storage_offset, size, stride, requires_grad, backward_hooks):
+def _build_tensor(zipfile, archive_name, storage, storage_offset, size, stride, requires_grad, backward_hooks):
     if storage_offset or backward_hooks:
         raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride, backward_hooks))
 
@@ -351,7 +351,7 @@ def _build_tensor(zipfile, storage, storage_offset, size, stride, requires_grad,
         raise ValueError("expected storage", storage)
 
     dtype, dtype_size = DTYPE_MAP[dtype_str]
-    data_path = f"archive/data/{index}"
+    data_path = f"{archive_name}/data/{index}"
     data = zipfile.read(data_path)
 
     expected_size = element_count * dtype_size
@@ -363,16 +363,37 @@ def _build_tensor(zipfile, storage, storage_offset, size, stride, requires_grad,
     return tensor.set_(tensor, storage_offset = 0, size = torch.Size(size), stride = stride)
 
 
+def get_archive_name(zipfile: zipfile.ZipFile, required: bool, data_only: bool = True):
+    names = set(zipfile.namelist())
+    for file in zipfile.filelist:
+        if "/" in file.filename:
+            prefix = file.filename[:file.filename.index("/")]
+            if not data_only:
+                return prefix
+
+            if f"{prefix}/data.pkl" in names:
+                print(f"found {prefix=}")
+                return prefix
+
+    if required:
+        raise ValueError("archive prefix not found")
+
+
 def torch_safe_load_dict(model_path_or_zipfile: Union[str, zipfile.ZipFile], extended: bool = False):
     if isinstance(model_path_or_zipfile, str):
         model_path_or_zipfile = zipfile.ZipFile(model_path_or_zipfile)
 
-    data_pickle_bytes = model_path_or_zipfile.read("archive/data.pkl")
+    try:
+        data_pickle_bytes = model_path_or_zipfile.read("archive/data.pkl")
+        archive_name = "archive"
+    except KeyError:
+        archive_name = get_archive_name(model_path_or_zipfile, True)
+        data_pickle_bytes = model_path_or_zipfile.read(f"{archive_name}/data.pkl")
 
     def persistent_id_load_fn(arg):
         return arg
 
-    build_tensor = functools.partial(_build_tensor, model_path_or_zipfile)
+    build_tensor = functools.partial(_build_tensor, model_path_or_zipfile, archive_name)
     model = pickle_bytes_safe_load_dict(
         data_pickle_bytes, persistent_id_load_fn,
         reduce_fns_custom = {

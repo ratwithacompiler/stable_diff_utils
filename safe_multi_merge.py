@@ -104,7 +104,7 @@ if sys.version_info[:2] >= (3, 9):
 else:
     from typing import Dict, List, Tuple, Set, Union, Optional, Iterable, Type, Callable, Any, Generator, TypeVar
 
-from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_ema, statedict_strip_ema, _build_tensor, _guess_filetype
+from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_ema, statedict_strip_ema, get_archive_name, _build_tensor, _guess_filetype
 
 try:
     import safetensors
@@ -288,6 +288,7 @@ class SafetensorsLazyTensor(LazyTensor):
 class TorchLazyTensor(LazyTensor):
     _ctx: Any
     _zip_file: ZipFile
+    _archive_name: str
     _storage_tup: tuple
     _data_path: str
 
@@ -313,12 +314,12 @@ class TorchLazyTensor(LazyTensor):
 
     def load_copy(self):
         return _build_tensor(
-            self._zip_file, self._storage_tup, self._storage_offset, self._size,
+            self._zip_file, self._archive_name, self._storage_tup, self._storage_offset, self._size,
             self._stride, self._requires_grad, None,
         )
 
 
-def _build_lazy_tensor(ctx, zipfile: ZipFile, storage_tup, storage_offset, size, stride, requires_grad, backward_hooks):
+def _build_lazy_tensor(ctx, zipfile: ZipFile, archive_name: str, storage_tup, storage_offset, size, stride, requires_grad, backward_hooks):
     if storage_offset or backward_hooks:
         raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride, backward_hooks))
 
@@ -327,7 +328,7 @@ def _build_lazy_tensor(ctx, zipfile: ZipFile, storage_tup, storage_offset, size,
         raise ValueError("expected storage", storage)
 
     dtype, dtype_size = DTYPE_MAP[dtype_str]
-    data_path = f"archive/data/{index}"
+    data_path = f"{archive_name}/data/{index}"
     data_size = zipfile.getinfo(data_path).file_size
 
     expected_size = element_count * dtype_size
@@ -335,19 +336,24 @@ def _build_lazy_tensor(ctx, zipfile: ZipFile, storage_tup, storage_offset, size,
         raise ValueError("read unexpected amount of bytes",
                          data_size, expected_size, data_path, element_count, dtype_size)
 
-    return TorchLazyTensor(ctx, zipfile, storage_tup, data_path, storage_offset, torch.Size(size), stride, requires_grad)
+    return TorchLazyTensor(ctx, zipfile, archive_name, storage_tup, data_path, storage_offset, torch.Size(size), stride, requires_grad)
 
 
 def torch_safe_load_dict_lazy(model_path_or_zipfile: Union[str, ZipFile], extended: bool = False, tensor_ctx = None):
     if isinstance(model_path_or_zipfile, str):
         model_path_or_zipfile = ZipFile(model_path_or_zipfile)
 
-    data_pickle_bytes = model_path_or_zipfile.read("archive/data.pkl")
+    try:
+        data_pickle_bytes = model_path_or_zipfile.read("archive/data.pkl")
+        archive_name = "archive"
+    except KeyError:
+        archive_name = get_archive_name(model_path_or_zipfile, True)
+        data_pickle_bytes = model_path_or_zipfile.read(f"{archive_name}/data.pkl")
 
     def persistent_id_load_fn(arg):
         return arg
 
-    build_tensor = functools.partial(_build_lazy_tensor, tensor_ctx, model_path_or_zipfile)
+    build_tensor = functools.partial(_build_lazy_tensor, tensor_ctx, model_path_or_zipfile, archive_name)
     model = pickle_bytes_safe_load_dict(
         data_pickle_bytes, persistent_id_load_fn,
         reduce_fns_custom = {
