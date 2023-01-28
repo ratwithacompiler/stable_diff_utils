@@ -89,14 +89,14 @@ def var_parse_action(section, pos, res):
     return Var(res[0])
 
 
-def mul_parse_action(section, pos, full):
-    # print("mul_parse_action", (pos, full))
+def factor_parse_action(section, pos, full):
+    # print("factor_parse_action", (pos, full))
     ensure_equal(len(full), 1)
     res = full[0]
     # for pos, i in enumerate(res):
     #     print(pos, i)
-    ensure_equal(len(res), 3, "mul only allowed once for variable/expression", len(res), pos, res)
-    ensure_type(res[0], Tens, "left mul op must be Tensor", res[0], full)
+    ensure_equal(len(res), 3, "factor only allowed once for variable/expression", len(res), pos, res)
+    ensure_type(res[0], Tens, "left factor op must be Tensor", res[0], full)
     ensure_equal(res[1], FACTOR_CHAR)
 
     num_str = res[2]
@@ -196,7 +196,7 @@ def make_parser(enablePackrat: Optional[bool] = True):
     expr = pyp.infix_notation(
         operand,
         [
-            (factor_op, 2, pyp.opAssoc.LEFT, mul_parse_action),
+            (factor_op, 2, pyp.opAssoc.LEFT, factor_parse_action),
             (minus_op, 2, pyp.opAssoc.LEFT, minus_parse_action),
             (add_op, 2, pyp.opAssoc.LEFT, add_parse_action),
             (merge_op, 2, pyp.opAssoc.LEFT, plus_parse_action),
