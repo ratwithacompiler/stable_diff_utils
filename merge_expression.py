@@ -17,6 +17,7 @@ MERGE_CHAR = "+"
 ADD_CHAR = "<"
 MINUS_CHAR = "-"
 FACTOR_CHAR = "@"
+MUL_CHAR = "%"
 
 
 class Tens():
@@ -73,6 +74,16 @@ class Add(Tens):
 
 
 @dataclass()
+class Mul(Tens):
+    item: Tens
+    factor: Union[int, float]
+    factor_str: Optional[str] = None
+
+    def __repr__(self):
+        return f" {self.item!r} * {self.factor!r} "
+
+
+@dataclass()
 class RunExp():
     item: Union[Add, Merge]
 
@@ -107,6 +118,25 @@ def factor_parse_action(section, pos, full):
         num = float(num_str) if num_str.count(".") else int(num_str)
     ensure_type(num_str, str)
     return Factored(res[0], num, num_str)
+
+
+def mul_parse_action(section, pos, full):
+    ensure_equal(len(full), 1)
+    res = full[0]
+    # for pos, i in enumerate(res):
+    #     print(pos, i)
+    ensure_equal(len(res), 3, "mul only allowed once for variable/expression", len(res), pos, res)
+    ensure_type(res[0], Tens, "left mul op must be Tensor", res[0], full)
+    ensure_equal(res[1], MUL_CHAR)
+
+    num_str = res[2]
+    if isinstance(num_str, int):
+        num = num_str
+        num_str = str(num_str)
+    else:
+        num = float(num_str) if num_str.count(".") else int(num_str)
+    ensure_type(num_str, str)
+    return Mul(res[0], num, num_str)
 
 
 def minus_parse_action(section, pos, full):
@@ -189,6 +219,7 @@ def make_parser(enablePackrat: Optional[bool] = True):
     merge_op = pyp.oneOf(MERGE_CHAR)
     minus_op = pyp.oneOf(MINUS_CHAR)
     add_op = pyp.oneOf(ADD_CHAR)
+    mul_op = pyp.oneOf(MUL_CHAR)
 
     # minusop = pyp.oneOf("-")
     # plusop = pyp.oneOf("+")
@@ -198,6 +229,7 @@ def make_parser(enablePackrat: Optional[bool] = True):
         [
             (factor_op, 2, pyp.opAssoc.LEFT, factor_parse_action),
             (minus_op, 2, pyp.opAssoc.LEFT, minus_parse_action),
+            (mul_op, 2, pyp.opAssoc.LEFT, mul_parse_action),
             (add_op, 2, pyp.opAssoc.LEFT, add_parse_action),
             (merge_op, 2, pyp.opAssoc.LEFT, plus_parse_action),
         ],
@@ -215,6 +247,8 @@ def runexp_to_str(runexp: RunExp, use_original_factor: bool):
             return "(" + _exp_run_minus(tens) + ")"
         if isinstance(tens, Add):
             return "(" + _exp_run_add(tens) + ")"
+        if isinstance(tens, Mul):
+            return "(" + _exp_run_mul(tens) + ")"
         raise ValueError("unsupported tens", tens)
 
     def _exp_run_minus(minus: Minus):
@@ -226,6 +260,10 @@ def runexp_to_str(runexp: RunExp, use_original_factor: bool):
         left = _exp_get(add.left)
         right = _exp_get(add.right)
         return f"{left}{ADD_CHAR}{right}"
+
+    def _exp_run_mul(mul: Mul):
+        item = _exp_get(mul.item)
+        return f"{item}{MUL_CHAR}{mul.factor_str}"
 
     def _exp_run_merge(merge: Merge):
         factor_total = merge.factor_total()
@@ -265,6 +303,8 @@ def runexp_vars(runexp: RunExp) -> Set[str]:
             _exp_run_minus(tens)
         elif isinstance(tens, Add):
             _exp_run_add(tens)
+        elif isinstance(tens, Mul):
+            _exp_run_mul(tens)
         else:
             raise ValueError("unsupported tens", tens)
 
@@ -275,6 +315,9 @@ def runexp_vars(runexp: RunExp) -> Set[str]:
     def _exp_run_add(add: Add):
         _exp_get(add.left)
         _exp_get(add.right)
+
+    def _exp_run_mul(mul: Mul):
+        _exp_get(mul.item)
 
     def _exp_run_merge(merge: Merge):
         for i in merge.items:

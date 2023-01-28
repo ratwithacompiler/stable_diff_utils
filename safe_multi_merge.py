@@ -118,7 +118,7 @@ except:
 
 import torch
 import merge_expression
-from merge_expression import Merge, RunExp, Tens, Var, Minus, runexp_to_str
+from merge_expression import Add, Mul, Merge, RunExp, Tens, Var, Minus, runexp_to_str
 
 logger = _logging.getLogger(__name__)
 IS_DEV = os.environ.get("DEV") == "1"
@@ -423,8 +423,11 @@ def _exp_get(ctx: ParseCtx, tens: Tens):
     if isinstance(tens, Minus):
         return _exp_run_minus(ctx, tens)
 
-    if isinstance(tens, merge_expression.Add):
+    if isinstance(tens, Add):
         return _exp_run_add(ctx, tens)
+
+    if isinstance(tens, Mul):
+        return _exp_run_mul(ctx, tens)
 
     raise ValueError("unsupported tens", tens)
 
@@ -435,10 +438,15 @@ def _exp_run_minus(ctx: ParseCtx, minus: Minus):
     return torch.subtract(left, right)
 
 
-def _exp_run_add(ctx: ParseCtx, minus: merge_expression.Add):
-    left = _exp_get(ctx, minus.left)
-    right = _exp_get(ctx, minus.right)
+def _exp_run_add(ctx: ParseCtx, add: Add):
+    left = _exp_get(ctx, add.left)
+    right = _exp_get(ctx, add.right)
     return torch.add(left, right)
+
+
+def _exp_run_mul(ctx: ParseCtx, mul: Mul):
+    item = _exp_get(ctx, mul.item)
+    return torch.mul(item, mul.factor)
 
 
 INPAINT_INPUT_KEY = "model.diffusion_model.input_blocks.0.0.weight"
@@ -517,7 +525,7 @@ def _exp_run_merge(ctx: ParseCtx, merge: Merge):
 def _exp_run(ctx: ParseCtx, runexp: RunExp):
     if isinstance(runexp.item, Merge):
         return _exp_run_merge(ctx, runexp.item)
-    elif isinstance(runexp.item, merge_expression.Add):
+    elif isinstance(runexp.item, Add):
         return _exp_run_add(ctx, runexp.item)
     raise ValueError("invalid runexp type", runexp.item)
 
