@@ -1144,7 +1144,7 @@ def _safetensors_load_lazy(path: str, very_lazy: bool) -> dict:
 
 def main(
         inputs: List[Input], output_args: List[OutputArg], output_dir: Optional[str],
-        overwrite: bool, precision: str, extended: bool, add_parent_dirs: Optional[int],
+        overwrite: bool, skip_existing: bool, precision: str, extended: bool, add_parent_dirs: Optional[int],
         name_prefix: Optional[str], extension: Optional[str], inpaint_allowed: bool,
         name_original_expression: bool, name_relative_factors: bool,
         merge_unet: bool, merge_text_encoder: bool, merge_vae_encoder: bool,
@@ -1185,6 +1185,11 @@ def main(
         if os.path.exists(i.path):
             if os.path.isdir(i.path):
                 raise ValueError("expected file path, got dir", i.path)
+
+            if skip_existing:
+                print(f"skipping existing output file {str(i.path)!r}")
+                continue
+
             if not overwrite:
                 raise ValueError(f"output_file path exists already, overwriting disabled {i.path!r}")
 
@@ -1197,6 +1202,10 @@ def main(
 
         output.path = i.path
         outputs.append(output)
+
+    if not output_args:
+        raise ValueError("no outputs")
+
     ensure_unique(outputs, key = lambda out: out.path, ignored_keys = { "/dev/null" })
 
     for i in inputs:
@@ -1346,6 +1355,7 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser()
         parser.add_argument("-s", "--simple", action = "store_true", help = "no BUILD, int keys")
         parser.add_argument("-o", "--overwrite", action = "store_true")
+        parser.add_argument("-S", "--skip-existing", action = "store_true")
         parser.add_argument("-v", "--verbose", action = "store_true")
 
         parser.add_argument("-T", "--no-merge-text-encoder", action = "store_true")
@@ -1410,7 +1420,7 @@ if __name__ == "__main__":
         # exit()
         main(
             inputs, outputs, output_dir,
-            args.overwrite, args.precision, not args.simple, args.parent_dirs,
+            args.overwrite, args.skip_existing, args.precision, not args.simple, args.parent_dirs,
             args.name_prefix, args.name_ext, not args.no_inpaint,
             args.name_original_expression, not args.name_original_factors,
             not args.no_merge_unet, not args.no_merge_text_encoder, not args.no_merge_vae,
