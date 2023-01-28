@@ -448,10 +448,6 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
         else:
             raise
 
-    if half:
-        print("halfing")
-        statedict_half(sd, True)
-
     if ema_rename_require:
         print("replacing model keys with required ema model keys")
         statedict_convert_ema(sd, False, print_stats = True)
@@ -462,6 +458,10 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
     if ema_strip:
         print("stripping ema model keys")
         statedict_strip_ema(sd, True)
+
+    if half:
+        print("halfing")
+        statedict_half(sd, True)
 
     model = { "state_dict": sd }
 
