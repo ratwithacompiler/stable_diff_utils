@@ -870,6 +870,12 @@ def inputs_outputs_merge_in_memory(
     return new_sds
 
 
+try:
+    from torch.storage import _TypedStorage as SaveTypedStorage
+except:
+    from torch.storage import TypedStorage as SaveTypedStorage
+
+
 class _OutputWriter():
     def __init__(self, output: Output):
         self.output = output
@@ -889,7 +895,7 @@ class _OutputWriter():
         pos = self.persistent_id_pos
 
         storage = tensor.storage()
-        if isinstance(storage, torch.storage._TypedStorage):
+        if isinstance(storage, SaveTypedStorage):
             type_str = self.dtype_classes[storage.dtype]
             bytes_len = storage.size()
         else:
