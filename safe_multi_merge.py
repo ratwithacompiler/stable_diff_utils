@@ -23,33 +23,9 @@
 
 """
 deps: torch pyparsing==3.0.*
+optional: tqdm safetensors
 
 usage:
-    simple mode, single output file all merged together with weighted averaging with chosen factors:
-        (all factors will be normalized to total of 1)
-
-        ./safe_multi_merge.py single output_filepath_name.ckpt \
-        -i /model_path/mod1.ckpt 1 \
-        -i /model_path/asdf.ckpt 1 \
-        -i /model_path/test.ckpt 1 \
-        -i /model_path/long_name_whatever_123.ckpt 2
-
-        will merge into one model with weights 0.2, 0.2, 0.2, 0.4 respectively, saved as output_filepath_name.ckpt.
-
-        For auto naming just pass a directory as argument (needs to exist as directory or end with /),
-        by default uses model filename unless -I is used and custom name is given:
-
-
-        ./safe_multi_merge.py single ./target/folder/ \
-        -i /model_path/mod1.ckpt 1 \
-        -i /model_path/other.ckpt 1.5 \
-        -i /model_path/example.ckpt 2.1 \
-        -I /model_path/long_name_whatever_123.ckpt Custom_NAME 2
-
-        will be written to: ./target/folder/merged_@UTV_mod1@0.1515_+other@0.2273_+example@0.3182_+Custom_NAME@0.303.ckpt
-
-
-
     merging with multiple outputs or complex merge expressions:
         Only loads individual tensors lazily as needed
         so even merging a large number of models into lots of
@@ -75,6 +51,30 @@ usage:
 
         # -e "filename.ckpt" "expression"   # -e is with custom name as first argument
         # -E "expression"                   # -E is auto named and saved to output folder target, must be specified with -E.
+
+    simple mode (deprecated), single output file all merged together with weighted averaging with chosen factors:
+        (all factors will be normalized to total of 1)
+
+        ./safe_multi_merge.py single output_filepath_name.ckpt \
+        -i /model_path/mod1.ckpt 1 \
+        -i /model_path/asdf.ckpt 1 \
+        -i /model_path/test.ckpt 1 \
+        -i /model_path/long_name_whatever_123.ckpt 2
+
+        will merge into one model with weights 0.2, 0.2, 0.2, 0.4 respectively, saved as output_filepath_name.ckpt.
+
+        For auto naming just pass a directory as argument (needs to exist as directory or end with /),
+        by default uses model filename unless -I is used and custom name is given:
+
+
+        ./safe_multi_merge.py single ./target/folder/ \
+        -i /model_path/mod1.ckpt 1 \
+        -i /model_path/other.ckpt 1.5 \
+        -i /model_path/example.ckpt 2.1 \
+        -I /model_path/long_name_whatever_123.ckpt Custom_NAME 2
+
+        will be written to: ./target/folder/merged_@UTV_mod1@0.1515_+other@0.2273_+example@0.3182_+Custom_NAME@0.303.ckpt
+
 
 """
 
@@ -149,17 +149,12 @@ class Input():
 
 
 @dataclasses.dataclass()
-class BasicMerge():
-    factors: List[Union[int, float]]
-
-
-@dataclasses.dataclass()
 class ExpressionMerge():
     merge: RunExp
     original_expression: Optional[str] = None
 
 
-Merger = Union[BasicMerge, ExpressionMerge, Callable]
+Merger = Union[ExpressionMerge, Callable]
 
 
 @dataclasses.dataclass()
@@ -236,13 +231,6 @@ class Output():
                 return i.merger
 
         raise ValueError("never got merger for key", key)
-
-    def configs(self, key: str, inputs_cnt):
-        merge = self.key_merge(key)
-        if isinstance(merge, BasicMerge):
-            return merge.factors
-        else:
-            return [None for _ in range(inputs_cnt)]
 
 
 class LazyTensor():
@@ -366,22 +354,9 @@ def torch_safe_load_dict_lazy(model_path_or_zipfile: Union[str, ZipFile], extend
     return model
 
 
-def merge_weighted(_ctx, tensors: List[torch.Tensor], factors: List[Union[int, float]]) -> torch.Tensor:
-    assert len(tensors) == len(factors)
-    total = sum(factors)
-    factors = [i / total for i in factors]
-
-    base: torch.Tensor = tensors[0] * factors[0]
-    for pos, t in enumerate(tensors):
-        if not pos:
-            continue
-        base = base + (tensors[pos] * factors[pos])
-    return base
-
-
-def _merge_use_first(_ctx, vals: List[Any], _configs):
+def _merge_use_first(_ctx, vals: dict[str, Any]):
     # print("_merge_use_first!!!", ctx, len(vals), str(vals).replace("\n","")[:100], factors)
-    for i in vals:
+    for i in vals.values():
         if i is not None:
             return i
     raise ValueError("no non None value found", vals)
@@ -531,32 +506,24 @@ def _exp_run(ctx: ParseCtx, runexp: RunExp):
 
 
 def merge_tensors(
-        conf: Settings, key: str, output: Output, configs: List, inputs: List[Input],
-        tensors: List[torch.Tensor], missing_inputs: List[Input], has_floats: bool, has_non_floats: bool,
+        conf: Settings, key: str, output: Output,
+        tensors: dict[str, torch.Tensor], missing_inputs: List[Input], has_floats: bool, has_non_floats: bool,
 ) -> torch.Tensor:
     merge = output.key_merge(key)
 
     try:
         if isinstance(merge, ExpressionMerge):
-            if len(tensors) != len(inputs):
-                raise ValueError("huh", len(tensors), len(inputs))
-            pctx = ParseCtx({ i.ident: t for (t, i) in zip(tensors, inputs) }, key, conf.merge_inpainting)
+            pctx = ParseCtx(tensors, key, conf.merge_inpainting)
             return _exp_run(pctx, merge.merge)
 
-        if isinstance(merge, BasicMerge):
-            if has_non_floats or not has_floats:
-                raise ValueError(f"invalid tensors", key, has_floats, has_non_floats, tensors)
-            if missing_inputs:
-                raise _MissingTensorError(f"missing tensors", key, missing_inputs)
-            return merge_weighted(output, tensors, configs)
-
         if callable(merge):
-            return merge(output, tensors, configs)
+            return merge(output, tensors)
+
     except ModelKeyError as ex:
         logger.warning("model missing required, using fallback choice fn: %s, key: %r, model: %r",
                        output.missing_key_fallback_fn, key, ex.model_name)
         if output.missing_key_fallback_fn is not None:
-            return output.missing_key_fallback_fn(output, tensors, configs)
+            return output.missing_key_fallback_fn(output, tensors)
         raise
 
         # return i.merger(key, ctx, configs, inputs, tensors, missing_inputs, has_floats, has_non_floats)
@@ -608,26 +575,24 @@ def _precision_arg(state_dicts: List[dict], precision: str = "auto", log = False
 
 
 def state_dicts_merge(
-        state_dicts: List[dict],
+        input_state_dicts: dict[str, dict],
         merge_contexts: List[Any],
         require_all: bool,
         merge_tensors_fn: Callable[[str, Any, List[Optional[torch.Tensor]], bool, bool], Optional[torch.Tensor]],
-        merge_non_tensors_fn: Callable[[str, Any, List[Optional[Any]]], Any],
+        merge_non_tensors_fn: Callable[[str, Any], Any],
         no_mixed: bool = False,
         precision: str = "auto",
-        never_load_inputs: Optional[Set[int]] = None,
         work_iter: Optional[Callable[[Iterable], Iterable]] = None,
 ) -> List[Dict]:
-    state_dicts = list(state_dicts)
-    never_load_inputs = never_load_inputs or []
+    state_dicts = list(input_state_dicts.values())
+    ensure(state_dicts)
+
     all_keys = set()
-    for pos, sd in enumerate(state_dicts):
-        if pos not in never_load_inputs:
-            all_keys = all_keys | sd.keys()
+    for sd in state_dicts:
+        all_keys = all_keys | sd.keys()
 
     expected_floats = { torch.float16, torch.float32 }
-    used_sds = [i for pos, i in enumerate(state_dicts) if pos not in never_load_inputs]
-    use_precision = _precision_arg(used_sds, precision, True)
+    use_precision = _precision_arg(state_dicts, precision, True)
 
     merge_contexts = list(merge_contexts)
     new_sd_tups = [(i, { }) for i in merge_contexts]
@@ -636,31 +601,29 @@ def state_dicts_merge(
         all_keys = work_iter(all_keys)
 
     for key in all_keys:
-        lazy_tensors = []
-        others = []
-        for sd in state_dicts:
+        lazy_tensors = { }
+        others = { }
+        for sid, sd in input_state_dicts.items():
             val = sd.get(key)
             if isinstance(val, LazyTensor):
-                lazy_tensors.append(val)
+                lazy_tensors[sid] = val
             else:
                 if val is not None:
                     print("ignoring non tensor key", key, type(val))
-                lazy_tensors.append(None)
-                others.append(val)
+
+                lazy_tensors[sid] = None
+                others[sid] = val
 
         if len(others) == len(lazy_tensors):
             for merge_ctx, new_sd in new_sd_tups:
-                new_sd[key] = merge_non_tensors_fn(key, others, merge_ctx)
+                new_sd[key] = merge_non_tensors_fn(key, others)
             continue
 
-        if require_all and None in lazy_tensors:
-            missing = [pos for (pos, i) in enumerate(lazy_tensors) if i is None]
+        if require_all and None in lazy_tensors.values():
+            missing = { k for (k, v) in lazy_tensors.items() if v is None }
             raise ValueError(f"tensor missing from {len(missing)} state_dicts", key, missing)
 
-        for pos in never_load_inputs:
-            lazy_tensors[pos] = None
-
-        dtypes = { i.dtype() for i in lazy_tensors if i is not None }
+        dtypes = { i.dtype() for i in lazy_tensors.values() if i is not None }
         has_floats = dtypes & expected_floats
         non_floats = dtypes - expected_floats
 
@@ -673,9 +636,9 @@ def state_dicts_merge(
 
         # print(key, lazy_tensors)
         if has_floats:
-            tensors = [(i.load_copy().to(use_precision) if i is not None else None) for i in lazy_tensors]
+            tensors = { k: (v.load_copy().to(use_precision) if v is not None else None) for k, v in lazy_tensors.items() }
         else:
-            tensors = [(i.load_copy() if i is not None else None) for i in lazy_tensors]
+            tensors = { k: (v.load_copy() if v is not None else None) for k, v in lazy_tensors.items() }
 
         # sizes = { i.storage().nbytes() for i in tensors if i is not None }
         # if len(sizes) > 1:
@@ -689,30 +652,24 @@ def state_dicts_merge(
     return [new_sd for merge_ctx, new_sd in new_sd_tups]
 
 
-def _tensors_configs_filter(key: str, configs: Optional[List], inputs: List[Input], maybe_tensors: List[Optional[torch.Tensor]]):
-    # filter out None tensors and return with list of corresponding configs
-    assert len(maybe_tensors) == len(inputs)
-    assert len(maybe_tensors) == len(configs)
+def _tensors_configs_filter(key: str, maybe_tensors: dict[str, Optional[torch.Tensor]]):
+    tensors = { }
+    missing_input_keys = set()
 
-    combined = list(itertools.zip_longest(maybe_tensors, configs, inputs))
-    # filter out ones without tensor of that key in input or with config set to skip
-    with_tensor = [(t, c, i) for (t, c, i) in combined if t is not None and c is not SKIP_INPUT]
-    missing_key = [i for (t, c, i) in combined if t is None and c is not SKIP_INPUT]
+    for k, v in maybe_tensors.items():
+        if v is None:
+            missing_input_keys.add(k)
+        else:
+            tensors[k] = v
 
-    if not with_tensor:
-        raise ValueError("no tensors", key, len(maybe_tensors), len(with_tensor), maybe_tensors, with_tensor)
-
-    inputs = [i for (t, c, i) in with_tensor]
-    tensors = [t for (t, c, i) in with_tensor]
-    configs = [c for (t, c, i) in with_tensor]
-    return inputs, tensors, configs, missing_key
+    return tensors, missing_input_keys
 
 
 def _to_inputs(inputs: List[Union[Input, str]]) -> List[Input]:
     use_inputs = []
     for i in inputs:
         if not isinstance(i, Input):
-            i = Input(i, None)
+            i = Input(i, i)
             i.open()
         use_inputs.append(i)
     return use_inputs
@@ -769,16 +726,13 @@ def _all_equal_diff(tensors: Iterable[torch.Tensor]):
 
 
 def _all_equal(tensors: Iterable[torch.Tensor], key = None):
-    e1 = _all_equal_basic(tensors)
     try:
-        e2 = _all_equal_data(tensors)
-        if e1 != e2:
-            raise ValueError("wtf??", e1, e2)
+        return _all_equal_basic(tensors)
     except _ZeroDimErr:
         # logger.debug("ignoring zero dim _all_equal_data error for %r", key)
         pass
 
-    return e1
+    return False
 
 
 def _single_tensor_check(tensors: List[torch.Tensor], skip_equal: bool, key = None) -> Optional[torch.Tensor]:
@@ -815,12 +769,7 @@ def _never_used_inputs(inputs: List[Input], outputs: List[Output]) -> List[int]:
             mergers.append(merger.merger)
 
     for merge in mergers:
-        if isinstance(merge, BasicMerge):
-            ensure_equal(len(merge.factors), len(inputs))
-            for pos, factor in enumerate(merge.factors):
-                if factor is not SKIP_INPUT:
-                    used_input_idxs.add(pos)
-        elif isinstance(merge, ExpressionMerge):
+        if isinstance(merge, ExpressionMerge):
             used_vars = merge_expression.runexp_vars(merge.merge)
             for pos, i in enumerate(inputs):
                 if i.ident and i.ident in used_vars:
@@ -843,29 +792,36 @@ def inputs_outputs_merge_in_memory(
         skip_equal: bool = True,
 ):
     inputs = _to_inputs(inputs)
-    ensure_unique(inputs, lambda i: i.ident, ignored_keys = { None })
+    ensure_unique(inputs, lambda i: i.ident)
 
-    def merge_tensors(key: str, maybe_tensors: List[Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
-        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(key, ctx.configs(key, len(inputs)), inputs, maybe_tensors)
-        if tensor := _single_tensor_check(tensors, skip_equal, key) is not None:
-            return tensor
-        return merge_fn(key, ctx, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
-
-    sds = [i.state_dict() for i in inputs]
     outputs = [(i if isinstance(i, Output) else Output(None, i)) for i in configs_outputs]
+    ensure(outputs, "no outputs given")
+
     unknown = _unknown_vars(inputs, outputs)
     if unknown:
         raise ValueError("expression used unknown model names",
                          unknown, sorted(i.ident for i in inputs if i.ident))
+
     unused_input_idxs = _never_used_inputs(inputs, outputs)
     if unused_input_idxs:
         logger.info("not loading %s unused inputs: %s", len(unused_input_idxs),
                     [inputs[idx].ident or f"in[{idx}]" for idx in unused_input_idxs])
 
+    unused_input_idxs_set = set(unused_input_idxs)
+    inputs_by_id = { i.ident: i for i in inputs }
+    sds = { i.ident: i.state_dict() for pos, i in enumerate(inputs) if pos not in unused_input_idxs_set }
+
+    def merge_tensors(key: str, maybe_tensors: dict[str, Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
+        ensure_equal(len(sds), len(maybe_tensors))
+        tensors, missing_inputs_ids = _tensors_configs_filter(key, maybe_tensors)
+        missing_inputs = [inputs_by_id[i] for i in missing_inputs_ids]
+        if tensor := _single_tensor_check(list(tensors.values()), skip_equal, key) is not None:
+            return tensor
+        return merge_fn(key, ctx, tensors, missing_inputs, has_floats, is_mixed)
+
     new_sds = state_dicts_merge(
         sds, outputs, require_all, merge_tensors, merge_non_tensors,
-        precision = precision, never_load_inputs = unused_input_idxs,
-        work_iter = tqdm.tqdm if tqdm else None,
+        precision = precision, work_iter = tqdm.tqdm if tqdm else None,
     )
     return new_sds
 
@@ -931,18 +887,36 @@ def inputs_outputs_merge_torch_zip_stream(
             return self.reduce_res
 
     inputs = _to_inputs(inputs)
+    ensure_unique(inputs, lambda i: i.ident)
+    ensure(outputs, "no outputs given")
+
     output_writers = { id(i): _OutputWriter(i) for i in outputs }
 
     for ow in output_writers.values():
         ow.output.zip_file.writestr("archive/version", "3\n")
 
-    def merge_tensors(key: str, maybe_tensors: List[Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
+    unused_input_idxs = _never_used_inputs(inputs, outputs)
+    if unused_input_idxs:
+        logger.info("not loading %s unused inputs: %s", len(unused_input_idxs),
+                    [inputs[idx].ident or f"in[{idx}]" for idx in unused_input_idxs])
+    unknown = _unknown_vars(inputs, outputs)
+    if unknown:
+        raise ValueError("expression used unknown model names",
+                         unknown, sorted(i.ident for i in inputs if i.ident))
+
+    unused_input_idxs_set = set(unused_input_idxs)
+    inputs_by_id = { i.ident: i for i in inputs }
+    sds = { i.ident: i.state_dict() for pos, i in enumerate(inputs) if pos not in unused_input_idxs_set }
+
+    def merge_tensors(key: str, maybe_tensors: dict[str, Optional[torch.Tensor]], ctx: Output, has_floats: bool, is_mixed: bool):
         writer: _OutputWriter = output_writers[id(ctx)]
 
-        used_inputs, tensors, configs, missing_inputs = _tensors_configs_filter(key, ctx.configs(key, len(inputs)), inputs, maybe_tensors)
-        tensor = _single_tensor_check(tensors, skip_equal, key)
+        ensure_equal(len(sds), len(maybe_tensors))
+        tensors, missing_inputs_ids = _tensors_configs_filter(key, maybe_tensors)
+        missing_inputs = [inputs_by_id[i] for i in missing_inputs_ids]
+        tensor = _single_tensor_check(list(tensors.values()), skip_equal, key)
         if tensor is None:
-            tensor = merge_fn(key, ctx, configs, used_inputs, tensors, missing_inputs, has_floats, is_mixed)
+            tensor = merge_fn(key, ctx, tensors, missing_inputs, has_floats, is_mixed)
 
         # create fake classes that pickle serialize like torch.Tensor
         pers_id_tup = writer.persistent_id(tensor)
@@ -962,19 +936,9 @@ def inputs_outputs_merge_torch_zip_stream(
         reduced_res = (reduced_fn, (pers_id,) + reduced_args[1:])
         return _ReduceRes(reduced_res)
 
-    sds = [i.state_dict() for i in inputs]
-    unused_input_idxs = _never_used_inputs(inputs, outputs)
-    if unused_input_idxs:
-        logger.info("not loading %s unused inputs: %s", len(unused_input_idxs),
-                    [inputs[idx].ident or f"in[{idx}]" for idx in unused_input_idxs])
-    unknown = _unknown_vars(inputs, outputs)
-    if unknown:
-        raise ValueError("expression used unknown model names",
-                         unknown, sorted(i.ident for i in inputs if i.ident))
-
     new_sds = state_dicts_merge(
         sds, outputs, require_all, merge_tensors, merge_non_tensors,
-        precision = precision, never_load_inputs = unused_input_idxs,
+        precision = precision,
         work_iter = tqdm.tqdm if tqdm else None,
     )
     assert len(new_sds) == len(outputs)
@@ -1035,35 +999,7 @@ def _make_output_path(
     if add_parent_dirnames < 0:
         raise ValueError("negative add_parent_dirnames", add_parent_dirnames)
 
-    if output_arg.config[0] == "basic":
-        basic: BasicMerge = output_arg.config[1]
-        parts = []
-        factor_total = sum([i for i in basic.factors if i is not SKIP_INPUT])
-        for i, factor in itertools.zip_longest(inputs, basic.factors):
-            if factor is SKIP_INPUT:
-                continue
-
-            i: Input
-
-            if i.ident:
-                name = i.ident
-            else:
-                path = Path(i.path)
-                name = _cleaned_name(path.name)
-                if add_parent_dirnames:
-                    adding = list(reversed([i.name for i in path.parents]))[-add_parent_dirnames:]
-                    name = "_".join(adding + [name])
-
-            if relative_factors:
-                rel_factor = factor / factor_total
-                use_factor = f"{rel_factor:.4f}".rstrip("0")
-            else:
-                use_factor = factor
-
-            p = f"{name}@{use_factor}"
-            parts.append(p)
-        full_name = "_+_".join(parts)
-    elif output_arg.config[0] == "expression":
+    if output_arg.config[0] == "expression":
         if original_expression:
             full_name = output_arg.config[1].original_expression
         else:
@@ -1157,7 +1093,7 @@ def _safetensors_load_lazy(path: str, very_lazy: bool) -> dict:
 
 
 def main(
-        inputs: List[Input], output_args: List[OutputArg], output_dir: Optional[str],
+        inputs: List[Input], output_args: List[OutputArg], output_dir: Optional[str], mode: str,
         overwrite: bool, skip_existing: bool, precision: str, extended: bool, add_parent_dirs: Optional[int],
         name_prefix: Optional[str], extension: Optional[str], inpaint_allowed: bool,
         name_original_expression: bool, name_relative_factors: bool,
@@ -1222,10 +1158,16 @@ def main(
 
     ensure_unique(outputs, key = lambda out: out.path, ignored_keys = { "/dev/null" })
 
+    unused_inputs_ids = set(id(inputs[i]) for i in _never_used_inputs(inputs, outputs))
     for i in inputs:
+        if id(i) in unused_inputs_ids:
+            continue
         i.ensure_exists()
 
     for i in inputs:
+        if id(i) in unused_inputs_ids:
+            continue
+
         filetype = _guess_filetype(i.path, "ckpt")
         i.filetype = filetype
         print(f"loading {filetype} from {i.path!r}")
@@ -1306,36 +1248,6 @@ def main(
 if __name__ == "__main__":
     def setup():
         parse_num = lambda num: float(num) if "." in num else int(num)
-
-        def single(args):
-            tups_unnamed = [(parse_num(num), Input(path, None)) for (path, num) in args.input_file or []]
-            tups_named = [(parse_num(num), Input(path, name)) for (path, name, num) in args.input_file_named or []]
-            tups_all = tups_unnamed + tups_named
-
-            factors = [i[0] for i in tups_all]
-            inputs = [i[1] for i in tups_all]
-
-            # if os.path.isdir(args.output_file_or_dir):
-            if (args.output_file_or_dir
-                    and (
-                            args.output_file_or_dir[-1] in ("/", "\\")  # ends with / or \
-                            or os.path.isdir(args.output_file_or_dir)  # or is an existing dir
-                    )
-            ):
-                # is a dir, auto named later into output_dir
-                output_dir = args.output_file_or_dir
-                outputs = [OutputArg(None, ("basic", BasicMerge(factors)))]
-            else:
-                output_dir = None
-                outputs = [OutputArg(args.output_file_or_dir, ("basic", BasicMerge(factors)))]
-
-            return inputs, outputs, output_dir
-
-        def parse_factors(factors_arg: str):
-            factors = factors_arg.split(",")
-            factors = [(SKIP_INPUT if i.strip().lower() in ("s", "skip") else parse_num(i)) for i in factors]
-            return factors
-
         parsers = []
 
         def parse_expression(expression: str) -> ExpressionMerge:
@@ -1353,16 +1265,13 @@ if __name__ == "__main__":
             inputs_named = [Input(path, name) for (path, name) in args.input_file_named or []]
             inputs = inputs_basic + inputs_named
 
-            outputs_unnamed = [OutputArg(None, ("basic", BasicMerge(parse_factors(factors)))) for factors in args.output or []]
-            outputs_named = [OutputArg(path, ("basic", BasicMerge(parse_factors(factors)))) for (path, factors) in args.output_file or []]
-
             exp_unnamed = [
                 OutputArg(None, ("expression", parse_expression(exp))) for exp in args.output_expression or []
             ]
             exp_named = [
                 OutputArg(path, ("expression", parse_expression(exp))) for (path, exp) in args.output_expression_file or []
             ]
-            outputs = outputs_unnamed + outputs_named + exp_unnamed + exp_named
+            outputs = exp_unnamed + exp_named
 
             return inputs, outputs, args.output_dir
 
@@ -1402,15 +1311,9 @@ if __name__ == "__main__":
                             help = "add the names of up to [n] parent directories in front of each input name when generating output filename")
 
         sub_parsers = parser.add_subparsers(title = "merge type", required = True)
-        single_parser = sub_parsers.add_parser("single")
-        single_parser.set_defaults(fn = single)
-
-        single_parser.add_argument("-i", "--input-file", nargs = 2, action = "append")
-        single_parser.add_argument("-I", "--input-file-named", nargs = 3, action = "append")
-        single_parser.add_argument("output_file_or_dir")
 
         multi_parser = sub_parsers.add_parser("multi")
-        multi_parser.set_defaults(fn = multi)
+        multi_parser.set_defaults(fn = multi, mode = "multi")
         multi_parser.add_argument("-i", "--input-file", action = "append")
         multi_parser.add_argument("-I", "--input-file-named", nargs = 2, action = "append")
 
@@ -1421,6 +1324,7 @@ if __name__ == "__main__":
         multi_parser.add_argument("-e", "--output-expression-file", nargs = 2, action = "append")
         multi_parser.add_argument("-E", "--output-expression", action = "append",
                                   help = "auto named output file, output-dir required")
+        # multi_parser.add_argument("-l", "--no-lazyload-inputs", action = "store_true")
 
         multi_parser.add_argument("output_dir", nargs = "?")
 
@@ -1428,12 +1332,12 @@ if __name__ == "__main__":
         _logging.basicConfig(level = _logging.DEBUG if args.verbose else _logging.INFO)
 
         inputs, outputs, output_dir = args.fn(args)
-        print(args)
+        # print(args)
         # print(inputs)
         # print(outputs)
         # exit()
         main(
-            inputs, outputs, output_dir,
+            inputs, outputs, output_dir, args.mode,
             args.overwrite, args.skip_existing, args.precision, not args.simple, args.parent_dirs,
             args.name_prefix, args.name_ext, not args.no_inpaint,
             args.name_original_expression, not args.name_original_factors,
