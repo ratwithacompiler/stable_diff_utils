@@ -71,6 +71,25 @@ def statedict_half(state_dict, print_stats: bool = False):
     return (halfed_cnt, halfed_bytes, total_bytes)
 
 
+def statedict_clean_nontensors(sd: dict, print_stats: bool = False, verbose: bool = False):
+    stripped = { }
+    for key, val in sd.items():
+        if not isinstance(val, torch.Tensor):
+            stripped[key] = val
+
+    for key in stripped:
+        sd.pop(key)
+
+    if print_stats:
+        verbose_str = ""
+        if verbose:
+            verbose_str = f"stripped: {sorted(stripped.keys())}."
+
+        print(f"stripped {len(stripped)} non tensor keys. {verbose_str}")
+
+    return stripped
+
+
 def statedict_convert_ema(sd: dict, optional: bool, print_stats: bool = False, verbose: bool = False):
     update = { }
     stripped = { }
@@ -95,7 +114,7 @@ def statedict_convert_ema(sd: dict, optional: bool, print_stats: bool = False, v
 
     sd.update(update)
 
-    if print_stats:
+    if print_stats: # and (stripped or verbose)
         verbose_str = ""
         if verbose:
             verbose_str = f"stripped: {sorted(stripped.keys())}, missed: {sorted(missing)}, kept: {sorted(ema_keys_kept)}."
@@ -418,7 +437,7 @@ def _guess_filetype(path: str, default):
 
 
 def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool,
-         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
+         ema_rename_require: bool, ema_rename_optional, ema_strip: bool, tensors_only: bool,
          set_times: bool, use_tmpfile: bool, fixed_write_filetype: str):
     if not overwrite and os.path.exists(output_path):
         raise ValueError(f"output_file path exists already, overwriting disabled {output_path!r}")
@@ -447,6 +466,10 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
             sd = model
         else:
             raise
+
+    if tensors_only:
+        print("stripping non tensor values from state_dict")
+        statedict_clean_nontensors(sd, print_stats = True, verbose = True)
 
     if ema_rename_require:
         print("replacing model keys with required ema model keys")
@@ -524,6 +547,7 @@ if __name__ == "__main__":
         parser.add_argument("--ema-rename", action = "store_true", help = "replace normal model keys with ema equivalent, ema keys not kept separately, require ema keys")
         parser.add_argument("-E", "--ema-strip", action = "store_true", help = "strip ema model keys")
         parser.add_argument("-t", "--times", action = "store_true", help = "set same access/modified time on output file as on input file")
+        parser.add_argument("-T", "--tensors-only", action = "store_true", help = "strip anything from state_dict that's not a Tensor")
 
         parser.add_argument("-N", "--no-tempfile", action = "store_true", help = "write to output file directly, don't use tempfile and rename")
 
@@ -538,7 +562,7 @@ if __name__ == "__main__":
             fixed_write_filetype = "safetensors"
 
         main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple, args.ema_rename, args.ema_rename_try, args.ema_strip,
-             args.times, not args.no_tempfile, fixed_write_filetype)
+             args.tensors_only, args.times, not args.no_tempfile, fixed_write_filetype)
 
 
     setup()
