@@ -78,6 +78,8 @@ usage:
 
 """
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import functools
@@ -414,9 +416,11 @@ def _exp_run_minus(ctx: ParseCtx, minus: Minus):
 
 
 def _exp_run_add(ctx: ParseCtx, add: Add):
-    left = _exp_get(ctx, add.left)
-    right = _exp_get(ctx, add.right)
-    return torch.add(left, right)
+    tensors = [_exp_get(ctx, i) for i in add.tensors]
+    res = tensors[0]
+    for i in tensors[1:]:
+        res = torch.add(res, i)
+    return res
 
 
 def _exp_run_mul(ctx: ParseCtx, mul: Mul):
@@ -1251,14 +1255,17 @@ if __name__ == "__main__":
         parsers = []
 
         def parse_expression(expression: str) -> ExpressionMerge:
-            if not parsers:
-                p = merge_expression.make_parser(True)
-                parsers.append(p)
-            else:
-                p = parsers[0]
+            try:
+                if not parsers:
+                    p = merge_expression.make_parser(True)
+                    parsers.append(p)
+                else:
+                    p = parsers[0]
 
-            merge = merge_expression.parse_run_expression(p, expression)
-            return ExpressionMerge(merge, expression)
+                merge = merge_expression.parse_run_expression(p, expression)
+                return ExpressionMerge(merge, expression)
+            except Exception as ex:
+                raise argparse.ArgumentTypeError(f"invalid expression {expression!r}: {ex}")
 
         def multi(args):
             inputs_basic = [Input(path, None) for path in args.input_file or []]

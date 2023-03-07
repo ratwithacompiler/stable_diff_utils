@@ -66,11 +66,10 @@ class Minus(Tens):
 
 @dataclass()
 class Add(Tens):
-    left: Tens
-    right: Tens
+    tensors: List[Tens]
 
     def __repr__(self):
-        return f" {self.left!r} < {self.right!r} "
+        return " < ".join([repr(i) for i in self.tensors])
 
 
 @dataclass()
@@ -159,25 +158,29 @@ def add_parse_action(section, pos, full):
     # print("add_parse_action", (pos, full))
     ensure_equal(len(full), 1)
     res = full[0]
-    ensure_equal(len(res), 3)
+    ensure(len(res) >= 3)
 
+    use = []
     for pos, i in enumerate(res):
         if i == ADD_CHAR:
             continue
         # print(pos, i)
         ensure_type(i, Tens, "add argument must be tensor", pos, type(i), i)
+        use.append(i)
 
     # ensure(len(res) == 3, "minus only allowed once for variable/expression", len(res), pos, res)
-    return Add(res[0], res[2])
+
+    ensure(len(use) >= 2, "add must have at least 2 tensors", use)
+    return Add(use)
 
 
-def plus_parse_action(section, pos, full):
-    # print("plus_parse_action", (pos, full))
+def merge_parse_action(section, pos, full):
+    # print("merge_parse_action", (pos, full))
     ensure_equal(len(full), 1)
     res = full[0]
     use = []
     for pos, i in enumerate(res):
-        if i == "+":
+        if i == MERGE_CHAR:
             continue
         # if isinstance(i, Merge):
         #     for a in i.items:
@@ -231,7 +234,7 @@ def make_parser(enablePackrat: Optional[bool] = True):
             (minus_op, 2, pyp.opAssoc.LEFT, minus_parse_action),
             (mul_op, 2, pyp.opAssoc.LEFT, mul_parse_action),
             (add_op, 2, pyp.opAssoc.LEFT, add_parse_action),
-            (merge_op, 2, pyp.opAssoc.LEFT, plus_parse_action),
+            (merge_op, 2, pyp.opAssoc.LEFT, merge_parse_action),
         ],
     ).set_parse_action(infix_parse_action)
     return expr
@@ -257,9 +260,8 @@ def runexp_to_str(runexp: RunExp, use_original_factor: bool):
         return f"{left}{MINUS_CHAR}{right}"
 
     def _exp_run_add(add: Add):
-        left = _exp_get(add.left)
-        right = _exp_get(add.right)
-        return f"{left}{ADD_CHAR}{right}"
+        tens = [_exp_get(i) for i in add.tensors]
+        return ADD_CHAR.join(tens)
 
     def _exp_run_mul(mul: Mul):
         item = _exp_get(mul.item)
@@ -313,8 +315,8 @@ def runexp_vars(runexp: RunExp) -> Set[str]:
         _exp_get(minus.right)
 
     def _exp_run_add(add: Add):
-        _exp_get(add.left)
-        _exp_get(add.right)
+        for i in add.tensors:
+            _exp_get(i)
 
     def _exp_run_mul(mul: Mul):
         _exp_get(mul.item)
