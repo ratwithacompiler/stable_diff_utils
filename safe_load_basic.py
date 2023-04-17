@@ -1194,7 +1194,7 @@ def statedict_half(state_dict, print_stats: bool = True):
     halfed_bytes = 0
 
     for key, val in list(state_dict.items()):
-        if val.dtype is torch.float32:
+        if val.dtype is torch.float32 or val.dtype is torch.float64:
             halfed = val.half()
             state_dict[key] = halfed
             halfed_cnt += 1
