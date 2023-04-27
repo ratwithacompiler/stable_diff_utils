@@ -308,6 +308,23 @@ class TorchLazyTensor(LazyTensor):
             self._stride, self._requires_grad, None,
         )
 
+    def load_meta(self):
+        return _build_tensor_meta(self._storage_tup, self._storage_offset, self._size, self._stride)
+
+
+def _build_tensor_meta(storage, storage_offset, size, stride):
+    if storage_offset:
+        raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride))
+
+    (storage, dtype_str, index, location, element_count) = storage
+    if storage != "storage":
+        raise ValueError("expected storage", storage)
+
+    dtype, dtype_size = DTYPE_MAP[dtype_str]
+    # return torch.empty(size, stride, dtype = dtype, device = "meta")
+    tensor = torch.empty_strided(tuple(size), stride, dtype = dtype, device = "meta")
+    return tensor
+
 
 def _build_lazy_tensor(ctx, zipfile: ZipFile, archive_name: str, storage_tup, storage_offset, size, stride, requires_grad, backward_hooks):
     if storage_offset or backward_hooks:
