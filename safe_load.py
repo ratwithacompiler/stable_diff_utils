@@ -52,6 +52,7 @@ logger = _logging.getLogger(__name__)
 def statedict_half(state_dict, print_stats: bool = False):
     halfed_cnt = 0
     halfed_bytes = 0
+    before_bytes = 0
     total_bytes = 0
 
     for key, val in list(state_dict.items()):
@@ -59,16 +60,22 @@ def statedict_half(state_dict, print_stats: bool = False):
             continue
 
         total_bytes += val.element_size() * val.nelement()
-        if val.dtype is torch.float32:  # avoid converting any ints to f16
+        if val.dtype is torch.float32 or val.dtype is torch.float64:  # avoid converting any ints to f16
+            before_bytes += val.element_size() * val.nelement()
             halfed = val.half()
             state_dict[key] = halfed
             halfed_cnt += 1
             halfed_bytes += halfed.element_size() * halfed.nelement()
 
+    diff_bytes = before_bytes - halfed_bytes
     if print_stats:
         print(f"halfed {halfed_cnt} keys, {halfed_bytes} bytes, {halfed_bytes / 1024 ** 3:.2f} GB!")
+        diff_bytes = before_bytes - halfed_bytes
+        if print_stats:
+            print(f"halfed {halfed_cnt} keys, {before_bytes}-{diff_bytes}={halfed_bytes}, "
+                  f"{before_bytes / 1024 ** 3:.2f}GB - {diff_bytes / 1024 ** 3:.2f}GB = {halfed_bytes / 1024 ** 3:.2f} GB!")
 
-    return (halfed_cnt, halfed_bytes, total_bytes)
+    return (halfed_cnt, diff_bytes, total_bytes)
 
 
 def statedict_clean_nontensors(sd: dict, print_stats: bool = False, verbose: bool = False):
