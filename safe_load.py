@@ -445,7 +445,17 @@ def _guess_filetype(path: str, default):
 
 def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool,
          ema_rename_require: bool, ema_rename_optional, ema_strip: bool, tensors_only: bool,
-         set_times: bool, use_tmpfile: bool, fixed_write_filetype: str):
+         set_times: bool, use_tmpfile: bool, fixed_write_filetype: str, full_model: bool):
+    if not os.path.exists(input_path):
+        raise ValueError("input path not found", input_path)
+
+    if not os.path.isfile(input_path):
+        raise ValueError("input path not a file", input_path)
+
+    if output_path.endswith("/") and os.path.isdir(output_path):
+        output_path = os.path.join(output_path, os.path.basename(input_path))
+        print(f"output path is dir, using filename from input file: {output_path!r}")
+
     if not overwrite and os.path.exists(output_path):
         raise ValueError(f"output_file path exists already, overwriting disabled {output_path!r}")
 
@@ -465,14 +475,17 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
     else:
         raise ValueError("invalid filetype", filetype)
 
-    try:
-        sd = model["state_dict"]
-    except:
-        if "model.diffusion_model.input_blocks.0.0.weight" in model:
-            print("loaded direct state_dict")
-            sd = model
-        else:
-            raise
+    if full_model:
+        sd = model
+    else:
+        try:
+            sd = model["state_dict"]
+        except:
+            if "model.diffusion_model.input_blocks.0.0.weight" in model:
+                print("loaded direct state_dict")
+                sd = model
+            else:
+                raise
 
     if tensors_only:
         print("stripping non tensor values from state_dict")
@@ -545,6 +558,7 @@ if __name__ == "__main__":
         parser.add_argument("-s", "--simple", action = "store_true", help = "no BUILD, int keys")
         parser.add_argument("-o", "--overwrite", action = "store_true")
         parser.add_argument("-H", "--half", action = "store_true")
+        parser.add_argument("-F", "--full-model", action = "store_true", help = "use full loaded model not just statedict")
 
         format_group = parser.add_mutually_exclusive_group()
         format_group.add_argument("-C", "--write-ckpt", action = "store_true")
@@ -569,7 +583,7 @@ if __name__ == "__main__":
             fixed_write_filetype = "safetensors"
 
         main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple, args.ema_rename, args.ema_rename_try, args.ema_strip,
-             args.tensors_only, args.times, not args.no_tempfile, fixed_write_filetype)
+             args.tensors_only, args.times, not args.no_tempfile, fixed_write_filetype, args.full_model)
 
 
     setup()
