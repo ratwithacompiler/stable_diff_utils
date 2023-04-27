@@ -97,7 +97,7 @@ def statedict_clean_nontensors(sd: dict, print_stats: bool = False, verbose: boo
     return stripped
 
 
-def statedict_convert_ema(sd: dict, optional: bool, print_stats: bool = False, verbose: bool = False):
+def statedict_convert_ema(sd: dict, optional: bool, print_stats: bool = False, verbose: bool = False) -> object:
     update = { }
     stripped = { }
     missing = set()
@@ -121,7 +121,7 @@ def statedict_convert_ema(sd: dict, optional: bool, print_stats: bool = False, v
 
     sd.update(update)
 
-    if print_stats: # and (stripped or verbose)
+    if print_stats:  # and (stripped or verbose)
         verbose_str = ""
         if verbose:
             verbose_str = f"stripped: {sorted(stripped.keys())}, missed: {sorted(missing)}, kept: {sorted(ema_keys_kept)}."
@@ -445,7 +445,8 @@ def _guess_filetype(path: str, default):
 
 def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool,
          ema_rename_require: bool, ema_rename_optional, ema_strip: bool, tensors_only: bool,
-         set_times: bool, use_tmpfile: bool, fixed_write_filetype: str, full_model: bool):
+         set_times: bool, use_tmpfile: bool, fixed_write_filetype: str, full_model: bool,
+         keep_metadata: bool):
     if not os.path.exists(input_path):
         raise ValueError("input path not found", input_path)
 
@@ -530,7 +531,23 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
             print("fixed removed empty {} state_dict inside state_dict")
             del sd["state_dict"]
 
-        safetensors.torch.save_file(sd, write_path)
+        metadata = None
+        if keep_metadata:
+            metadata_keys = []
+            for i in ["_metadata", "__metadata__"]:
+                if i not in sd:
+                    continue
+
+                if metadata is not None:
+                    raise ValueError("multiple metadata keys", i, metadata_keys)
+
+                metadata_keys.append(i)
+                metadata = dict(sd.pop(i))
+                # print(json.dumps(metadata, indent=4))
+                # metadata = None
+                pass
+
+        safetensors.torch.save_file(sd, write_path, metadata = metadata)
     else:
         raise ValueError("invalid filetype", filetype)
 
@@ -571,6 +588,7 @@ if __name__ == "__main__":
         parser.add_argument("-T", "--tensors-only", action = "store_true", help = "strip anything from state_dict that's not a Tensor")
 
         parser.add_argument("-N", "--no-tempfile", action = "store_true", help = "write to output file directly, don't use tempfile and rename")
+        parser.add_argument("-M", "--no-metadata", action = "store_true", help = "throw away _metadata and __metadata__ keys")
 
         # parser.add_argument("-S", "--strip", choices = ["ema", "non_ema"])
         args = parser.parse_args()
@@ -583,7 +601,7 @@ if __name__ == "__main__":
             fixed_write_filetype = "safetensors"
 
         main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple, args.ema_rename, args.ema_rename_try, args.ema_strip,
-             args.tensors_only, args.times, not args.no_tempfile, fixed_write_filetype, args.full_model)
+             args.tensors_only, args.times, not args.no_tempfile, fixed_write_filetype, args.full_model, not args.no_metadata)
 
 
     setup()
