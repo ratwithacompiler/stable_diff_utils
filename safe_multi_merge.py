@@ -202,7 +202,7 @@ class Output():
                     # ignore version, written by the torch writer itself, only needed with normal zipfile
                     # print("ignoring version", data)
                     return
-                ensure_equal(path.startswith("archive/"), True, "invalid path", path)
+                ensure_equal(path.startswith("archive/"), True, "invalid path", path)  # TODO: may be different in torch 1.13?
                 path = path[8:]
                 zf.file_like.write_record(path, data, len(data))
 
@@ -980,6 +980,90 @@ def inputs_outputs_merge_torch_zip_stream(
         pickler.dump(model)
         data = io_buffer.getvalue()
         writer.output.zip_file.writestr("archive/data.pkl", data)
+
+
+def torch_zip_stream(
+        output_path: Union[str, Output],
+        key_tensor_iter: Iterable[Tuple[str, Union[torch.Tensor, LazyTensor]]],
+        open_mode = "x",
+        wrap_in_dict: Optional[str] = None,
+        with_file = True, torch_writer = True
+):
+    import ctypes, pickle
+    import torch._utils
+
+    @dataclasses.dataclass
+    class _PersId():
+        persistent_id: Any
+
+    @dataclasses.dataclass
+    class _ReduceRes():
+        reduce_res: Any
+
+        def __reduce__(self):
+            return self.reduce_res
+
+    if isinstance(output_path, Output):
+        close = False
+        output = output_path
+    else:
+        close = True
+        output = Output(output_path, [], write_path = output_path)
+        output.open(open_mode, with_file = with_file, torch_writer = torch_writer)
+
+    ensure(output.zip_file, "output needs to be open")
+    writer = _OutputWriter(output)
+    writer.output.zip_file.writestr("archive/version", "3\n")
+
+    def _write(tensor: Union[torch.Tensor, LazyTensor]):
+        if isinstance(tensor, LazyTensor):
+            tensor = tensor.load_copy()
+
+        ensure(isinstance(tensor, torch.Tensor), "expected tensor", type(tensor))
+
+        # create fake classes that pickle serialize like torch.Tensor
+        pers_id_tup = writer.persistent_id(tensor)
+        if pers_id_tup[0] != "storage":
+            raise ValueError("expected storage as persistent id 0", pers_id_tup[0])
+        storage_key = pers_id_tup[2]
+
+        storage = tensor.storage()
+        buffer = (ctypes.c_char * storage.nbytes()).from_address(storage.data_ptr())
+        data_path = f"archive/data/{storage_key}"
+        writer.output.zip_file.writestr(data_path, bytes(buffer))
+
+        reduced_fn, reduced_args = tensor.__reduce_ex__(2)
+        assert reduced_fn is torch._utils._rebuild_tensor_v2
+
+        pers_id = _PersId(pers_id_tup)
+        reduced_res = (reduced_fn, (pers_id,) + reduced_args[1:])
+        return _ReduceRes(reduced_res)
+
+    def persistent_id(obj):
+        if isinstance(obj, _PersId):
+            return obj.persistent_id
+
+        return None
+
+    sd = { }
+    for key, tensor in key_tensor_iter:
+        res = _write(tensor)
+        sd[key] = res
+
+    if wrap_in_dict:
+        model = { wrap_in_dict: sd }
+    else:
+        model = sd
+
+    io_buffer = io.BytesIO()
+    pickler = pickle.Pickler(io_buffer, protocol = 2)
+    pickler.persistent_id = persistent_id
+    pickler.dump(model)
+    data = io_buffer.getvalue()
+    writer.output.zip_file.writestr("archive/data.pkl", data)
+
+    if close:
+        writer.output.close()
 
 
 def ensure_unique(items, key = None, ignored_keys: Optional[Set] = None):
