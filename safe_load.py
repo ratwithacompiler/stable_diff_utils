@@ -25,21 +25,23 @@
 # Supports nothing expect basic python types (int, float, str, list, tuple, dicts; arbitrarily nested)
 # and loading torch saved basic tensors.
 # Skips everything else.
-
 # dependencies: torch
 # usage: python safe_load.py [--half] [--overwrite] path_to_input.ckpt  path_where_to_save.ckpt
 
+import dataclasses
 import os.path
 import argparse
 import collections
 import zipfile
+from zipfile import ZipFile
 import functools
-from typing import Union
+from typing import Union, Any, Optional
 
 import torch
 import pickletools
 
 import logging as _logging
+
 
 try:
     import safetensors.torch
@@ -49,6 +51,144 @@ except:
 logger = _logging.getLogger(__name__)
 
 
+class LazyTensor():
+    def load(self, reload = False, dtype = None):
+        raise NotImplementedError()
+
+    def dtype(self):
+        raise NotImplementedError()
+
+    def unload(self):
+        raise NotImplementedError()
+
+    def load_copy(self):
+        raise NotImplementedError()
+
+
+@dataclasses.dataclass()
+class SafetensorsLazyTensor(LazyTensor):
+    safe_tensor: Any
+    safe_tensor_root: Any
+    safe_tensor_key: Any
+
+    def load(self, reload = False, dtype = None):
+        pass
+
+    def dtype(self):
+        st = self.safe_tensor
+        if st is None:
+            st = self.safe_tensor_root.get_tensor(self.safe_tensor_key)
+        return st.dtype
+
+    def unload(self):
+        pass
+
+    def load_copy(self):
+        st = self.safe_tensor
+        if st is None:
+            st = self.safe_tensor_root.get_tensor(self.safe_tensor_key)
+        return st.detach().clone()
+
+
+@dataclasses.dataclass()
+class TorchLazyTensor(LazyTensor):
+    _ctx: Any
+    _zip_file: ZipFile
+    _archive_name: str
+    _storage_tup: tuple
+    _data_path: str
+
+    _storage_offset: int
+    _size: torch.Size
+    _stride: Union[tuple, int]
+    _requires_grad: bool
+
+    tensor: Optional[torch.Tensor] = None
+
+    def load(self, reload = False, dtype = None):
+        if self.tensor is not None and not reload:
+            return self.tensor
+
+        self.tensor = self.load_copy()
+        return self.tensor
+
+    def dtype(self):
+        return DTYPE_MAP[self._storage_tup[1]][0]
+
+    def unload(self):
+        self.tensor = None
+
+    def load_copy(self):
+        return _build_tensor(
+            self._zip_file, self._archive_name, self._storage_tup, self._storage_offset, self._size,
+            self._stride, self._requires_grad, None,
+        )
+
+    def load_meta(self):
+        return _build_tensor_meta(self._storage_tup, self._storage_offset, self._size, self._stride)
+
+
+def _build_tensor_meta(storage, storage_offset, size, stride):
+    if storage_offset:
+        raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride))
+
+    (storage, dtype_str, index, location, element_count) = storage
+    if storage != "storage":
+        raise ValueError("expected storage", storage)
+
+    dtype, dtype_size = DTYPE_MAP[dtype_str]
+    # return torch.empty(size, stride, dtype = dtype, device = "meta")
+    tensor = torch.empty_strided(tuple(size), stride, dtype = dtype, device = "meta")
+    return tensor
+
+
+def _build_lazy_tensor(ctx, zipfile: ZipFile, archive_name: str, storage_tup, storage_offset, size, stride, requires_grad, backward_hooks):
+    if storage_offset or backward_hooks:
+        raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride, backward_hooks))
+
+    (storage, dtype_str, index, location, element_count) = storage_tup
+    if storage != "storage":
+        raise ValueError("expected storage", storage)
+
+    dtype, dtype_size = DTYPE_MAP[dtype_str]
+    data_path = f"{archive_name}/data/{index}"
+    data_size = zipfile.getinfo(data_path).file_size
+
+    expected_size = element_count * dtype_size
+    if data_size != expected_size:
+        raise ValueError("read unexpected amount of bytes",
+                         data_size, expected_size, data_path, element_count, dtype_size)
+
+    return TorchLazyTensor(ctx, zipfile, archive_name, storage_tup, data_path, storage_offset, torch.Size(size), stride, requires_grad)
+
+
+def torch_safe_load_dict_lazy(model_path_or_zipfile: Union[str, ZipFile], extended: bool = False, tensor_ctx = None):
+    if isinstance(model_path_or_zipfile, str):
+        model_path_or_zipfile = ZipFile(model_path_or_zipfile)
+
+    try:
+        data_pickle_bytes = model_path_or_zipfile.read("archive/data.pkl")
+        archive_name = "archive"
+    except KeyError:
+        archive_name = get_archive_name(model_path_or_zipfile, True)
+        data_pickle_bytes = model_path_or_zipfile.read(f"{archive_name}/data.pkl")
+
+    def persistent_id_load_fn(arg):
+        return arg
+
+    build_tensor = functools.partial(_build_lazy_tensor, tensor_ctx, model_path_or_zipfile, archive_name)
+    model = pickle_bytes_safe_load_dict(
+        data_pickle_bytes, persistent_id_load_fn,
+        reduce_fns_custom = {
+            "torch._utils _rebuild_tensor_v2": build_tensor,
+        },
+        reduce_fns_ignore_unknown = True,
+        extended = extended,
+    )
+
+    return model
+
+
 def statedict_half(state_dict, print_stats: bool = False):
     halfed_cnt = 0
     halfed_bytes = 0
@@ -56,6 +196,9 @@ def statedict_half(state_dict, print_stats: bool = False):
     total_bytes = 0
 
     for key, val in list(state_dict.items()):
+        if isinstance(val, LazyTensor):
+            state_dict[key] = val = val.load_copy()
+
         if not isinstance(val, torch.Tensor):
             continue
 
@@ -446,7 +589,7 @@ def _guess_filetype(path: str, default):
 def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool,
          ema_rename_require: bool, ema_rename_optional, ema_strip: bool, tensors_only: bool,
          set_times: bool, use_tmpfile: bool, fixed_write_filetype: str, full_model: bool,
-         keep_metadata: bool):
+         keep_metadata: bool, lazy_load: bool, lazy_write: bool):
     if not os.path.exists(input_path):
         raise ValueError("input path not found", input_path)
 
@@ -462,9 +605,14 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
 
     print(f"loading {input_path!r}")
 
+    is_lazy_ckpt = False
     filetype = _guess_filetype(input_path, "ckpt")
     if filetype == "ckpt":
-        model = torch_safe_load_dict(input_path, extended)
+        if lazy_load:
+            model = torch_safe_load_dict_lazy(input_path, extended)
+            is_lazy_ckpt = True
+        else:
+            model = torch_safe_load_dict(input_path, extended)
     elif filetype == "safetensors":
         sd = safetensors.torch.load_file(input_path)
         # if "state_dict" in sd:
@@ -503,7 +651,8 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
         print("stripping ema model keys")
         statedict_strip_ema(sd, True)
 
-    if half:
+    half_lazyily_while_writing = (lazy_write and is_lazy_ckpt)
+    if half and not half_lazyily_while_writing:
         print("halfing")
         statedict_half(sd, True)
 
@@ -521,8 +670,23 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
         print(f"writing to {output_path!r} as {filetype}, overwrite={overwrite}")
 
     if filetype == "ckpt":
-        with open(write_path, mode) as out_file:
-            torch.save(model, out_file)
+        if lazy_write:
+            def tensor_iter():
+                for key, val in sd.items():
+                    if isinstance(val, LazyTensor):
+                        val = val.load_copy()
+
+                    if half and isinstance(val, torch.Tensor) and val.dtype in (torch.float32, torch.float64):
+                        val = val.half()
+
+                    yield key, val
+
+            from safe_multi_merge import torch_zip_stream
+            torch_zip_stream(write_path, tensor_iter(), mode)
+        else:
+            with open(write_path, mode) as out_file:
+                torch.save(model, out_file)
+
     elif filetype == "safetensors":
         # non_tens = { k: v for (k, v) in sd.items() if not isinstance(v, torch.Tensor) }
         # print("non_tens", non_tens.keys(), non_tens)
@@ -576,6 +740,7 @@ if __name__ == "__main__":
         parser.add_argument("-o", "--overwrite", action = "store_true")
         parser.add_argument("-H", "--half", action = "store_true")
         parser.add_argument("-F", "--full-model", action = "store_true", help = "use full loaded model not just statedict")
+        parser.add_argument("-l", "--lazy", action = "store_true")
 
         format_group = parser.add_mutually_exclusive_group()
         format_group.add_argument("-C", "--write-ckpt", action = "store_true")
@@ -601,7 +766,8 @@ if __name__ == "__main__":
             fixed_write_filetype = "safetensors"
 
         main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple, args.ema_rename, args.ema_rename_try, args.ema_strip,
-             args.tensors_only, args.times, not args.no_tempfile, fixed_write_filetype, args.full_model, not args.no_metadata)
+             args.tensors_only, args.times, not args.no_tempfile, fixed_write_filetype, args.full_model, not args.no_metadata,
+             args.lazy, args.lazy)
 
 
     setup()

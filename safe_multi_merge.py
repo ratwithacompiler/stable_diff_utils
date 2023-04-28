@@ -106,7 +106,8 @@ if sys.version_info[:2] >= (3, 9):
 else:
     from typing import Dict, List, Tuple, Set, Union, Optional, Iterable, Type, Callable, Any, Generator, TypeVar
 
-from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_ema, statedict_strip_ema, get_archive_name, _build_tensor, _guess_filetype
+from safe_load import pickle_bytes_safe_load_dict, DTYPE_MAP, statedict_convert_ema, statedict_strip_ema, get_archive_name, _build_tensor, _guess_filetype, LazyTensor, SafetensorsLazyTensor, \
+    torch_safe_load_dict_lazy
 
 try:
     import safetensors
@@ -233,144 +234,6 @@ class Output():
                 return i.merger
 
         raise ValueError("never got merger for key", key)
-
-
-class LazyTensor():
-    def load(self, reload = False, dtype = None):
-        raise NotImplementedError()
-
-    def dtype(self):
-        raise NotImplementedError()
-
-    def unload(self):
-        raise NotImplementedError()
-
-    def load_copy(self):
-        raise NotImplementedError()
-
-
-@dataclasses.dataclass()
-class SafetensorsLazyTensor(LazyTensor):
-    safe_tensor: Any
-    safe_tensor_root: Any
-    safe_tensor_key: Any
-
-    def load(self, reload = False, dtype = None):
-        pass
-
-    def dtype(self):
-        st = self.safe_tensor
-        if st is None:
-            st = self.safe_tensor_root.get_tensor(self.safe_tensor_key)
-        return st.dtype
-
-    def unload(self):
-        pass
-
-    def load_copy(self):
-        st = self.safe_tensor
-        if st is None:
-            st = self.safe_tensor_root.get_tensor(self.safe_tensor_key)
-        return st.detach().clone()
-
-
-@dataclasses.dataclass()
-class TorchLazyTensor(LazyTensor):
-    _ctx: Any
-    _zip_file: ZipFile
-    _archive_name: str
-    _storage_tup: tuple
-    _data_path: str
-
-    _storage_offset: int
-    _size: torch.Size
-    _stride: Union[tuple, int]
-    _requires_grad: bool
-
-    tensor: Optional[torch.Tensor] = None
-
-    def load(self, reload = False, dtype = None):
-        if self.tensor is not None and not reload:
-            return self.tensor
-
-        self.tensor = self.load_copy()
-        return self.tensor
-
-    def dtype(self):
-        return DTYPE_MAP[self._storage_tup[1]][0]
-
-    def unload(self):
-        self.tensor = None
-
-    def load_copy(self):
-        return _build_tensor(
-            self._zip_file, self._archive_name, self._storage_tup, self._storage_offset, self._size,
-            self._stride, self._requires_grad, None,
-        )
-
-    def load_meta(self):
-        return _build_tensor_meta(self._storage_tup, self._storage_offset, self._size, self._stride)
-
-
-def _build_tensor_meta(storage, storage_offset, size, stride):
-    if storage_offset:
-        raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride))
-
-    (storage, dtype_str, index, location, element_count) = storage
-    if storage != "storage":
-        raise ValueError("expected storage", storage)
-
-    dtype, dtype_size = DTYPE_MAP[dtype_str]
-    # return torch.empty(size, stride, dtype = dtype, device = "meta")
-    tensor = torch.empty_strided(tuple(size), stride, dtype = dtype, device = "meta")
-    return tensor
-
-
-def _build_lazy_tensor(ctx, zipfile: ZipFile, archive_name: str, storage_tup, storage_offset, size, stride, requires_grad, backward_hooks):
-    if storage_offset or backward_hooks:
-        raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride, backward_hooks))
-
-    (storage, dtype_str, index, location, element_count) = storage_tup
-    if storage != "storage":
-        raise ValueError("expected storage", storage)
-
-    dtype, dtype_size = DTYPE_MAP[dtype_str]
-    data_path = f"{archive_name}/data/{index}"
-    data_size = zipfile.getinfo(data_path).file_size
-
-    expected_size = element_count * dtype_size
-    if data_size != expected_size:
-        raise ValueError("read unexpected amount of bytes",
-                         data_size, expected_size, data_path, element_count, dtype_size)
-
-    return TorchLazyTensor(ctx, zipfile, archive_name, storage_tup, data_path, storage_offset, torch.Size(size), stride, requires_grad)
-
-
-def torch_safe_load_dict_lazy(model_path_or_zipfile: Union[str, ZipFile], extended: bool = False, tensor_ctx = None):
-    if isinstance(model_path_or_zipfile, str):
-        model_path_or_zipfile = ZipFile(model_path_or_zipfile)
-
-    try:
-        data_pickle_bytes = model_path_or_zipfile.read("archive/data.pkl")
-        archive_name = "archive"
-    except KeyError:
-        archive_name = get_archive_name(model_path_or_zipfile, True)
-        data_pickle_bytes = model_path_or_zipfile.read(f"{archive_name}/data.pkl")
-
-    def persistent_id_load_fn(arg):
-        return arg
-
-    build_tensor = functools.partial(_build_lazy_tensor, tensor_ctx, model_path_or_zipfile, archive_name)
-    model = pickle_bytes_safe_load_dict(
-        data_pickle_bytes, persistent_id_load_fn,
-        reduce_fns_custom = {
-            "torch._utils _rebuild_tensor_v2": build_tensor,
-        },
-        reduce_fns_ignore_unknown = True,
-        extended = extended,
-    )
-
-    return model
 
 
 def _merge_use_first(_ctx, vals: dict[str, Any]):
