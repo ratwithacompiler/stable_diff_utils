@@ -709,7 +709,7 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
                     yield key, val
 
             from safe_multi_merge import torch_zip_stream
-            torch_zip_stream(write_path, tensor_iter(), mode)
+            torch_zip_stream(write_path, tensor_iter(), mode, non_tensors = "keep")
         else:
             with open(write_path, mode) as out_file:
                 torch.save(model, out_file)

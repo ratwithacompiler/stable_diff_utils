@@ -101,7 +101,7 @@ if __name__ == '__main__':
 from type_utils import ensure_equal, ensure
 
 if sys.version_info[:2] >= (3, 9):
-    from typing import Union, Optional, Any, TypeVar, List, Dict, Tuple
+    from typing import Union, Optional, Any, TypeVar, List, Dict, Tuple, Literal
     from collections.abc import Iterable, Callable, Generator, AsyncGenerator, Collection, Set
 else:
     from typing import Dict, List, Tuple, Set, Union, Optional, Iterable, Type, Callable, Any, Generator, TypeVar
@@ -850,7 +850,8 @@ def torch_zip_stream(
         key_tensor_iter: Iterable[Tuple[str, Union[torch.Tensor, LazyTensor]]],
         open_mode = "x",
         wrap_in_dict: Optional[str] = None,
-        with_file = True, torch_writer = True
+        with_file = True, torch_writer = True,
+        non_tensors: Literal["raise", "ignore", "keep"] = "raise",
 ):
     import ctypes, pickle
     import torch._utils
@@ -910,6 +911,17 @@ def torch_zip_stream(
 
     sd = { }
     for key, tensor in key_tensor_iter:
+        if not isinstance(tensor, torch.Tensor):
+            if non_tensors == "raise":
+                raise ValueError("expected tensor", key, type(tensor))
+            elif non_tensors == "ignore":
+                continue
+            elif non_tensors == "keep":
+                sd[key] = tensor
+                continue
+            else:
+                raise ValueError("invalid non_tensors", non_tensors)
+
         res = _write(tensor)
         sd[key] = res
 
