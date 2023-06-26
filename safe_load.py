@@ -130,9 +130,6 @@ class TorchLazyTensor(LazyTensor):
 
 
 def _build_tensor_meta(storage, storage_offset, size, stride):
-    if storage_offset:
-        raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride))
-
     (storage, dtype_str, index, location, element_count) = storage
     if storage != "storage":
         raise ValueError("expected storage", storage)
@@ -534,7 +531,7 @@ DTYPE_MAP = {
 
 
 def _build_tensor(zipfile, archive_name, storage, storage_offset, size, stride, requires_grad, backward_hooks):
-    if storage_offset or backward_hooks:
+    if backward_hooks:
         raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride, backward_hooks))
 
     (storage, dtype_str, index, location, element_count) = storage
@@ -551,7 +548,7 @@ def _build_tensor(zipfile, archive_name, storage, storage_offset, size, stride, 
                          len(data), expected_size, data_path, element_count, dtype_size)
 
     tensor = torch.frombuffer(data, dtype = dtype, requires_grad = requires_grad)
-    return tensor.set_(tensor, storage_offset = 0, size = torch.Size(size), stride = stride)
+    return tensor.set_(tensor, storage_offset = storage_offset, size = torch.Size(size), stride = stride)
 
 
 def get_archive_name(zipfile: zipfile.ZipFile, required: bool, data_only: bool = True):
