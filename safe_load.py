@@ -35,13 +35,14 @@ import collections
 import zipfile
 from zipfile import ZipFile
 import functools
-from typing import Union, Any, Optional
+from typing import Union, Any, Optional, Iterable
 
 import torch
 import pickletools
 
 import logging as _logging
 
+from pruning import SD_15_KEYS
 
 try:
     import safetensors.torch
@@ -143,7 +144,7 @@ def _build_tensor_meta(storage, storage_offset, size, stride):
 
 
 def _build_lazy_tensor(ctx, zipfile: ZipFile, archive_name: str, storage_tup, storage_offset, size, stride, requires_grad, backward_hooks):
-    if storage_offset or backward_hooks:
+    if backward_hooks:
         raise ValueError("unsupported _rebuild_tensor_v2 arg", (storage_offset, stride, backward_hooks))
 
     (storage, dtype_str, index, location, element_count) = storage_tup
@@ -189,7 +190,7 @@ def torch_safe_load_dict_lazy(model_path_or_zipfile: Union[str, ZipFile], extend
     return model
 
 
-def statedict_half(state_dict, print_stats: bool = False):
+def statedict_half(state_dict, print_stats: bool = False, verbose: bool = False):
     halfed_cnt = 0
     halfed_bytes = 0
     before_bytes = 0
@@ -212,11 +213,11 @@ def statedict_half(state_dict, print_stats: bool = False):
 
     diff_bytes = before_bytes - halfed_bytes
     if print_stats:
-        print(f"halfed {halfed_cnt} keys, {halfed_bytes} bytes, {halfed_bytes / 1024 ** 3:.2f} GB!")
-        diff_bytes = before_bytes - halfed_bytes
-        if print_stats:
+        if verbose:
             print(f"halfed {halfed_cnt} keys, {before_bytes}-{diff_bytes}={halfed_bytes}, "
                   f"{before_bytes / 1024 ** 3:.2f}GB - {diff_bytes / 1024 ** 3:.2f}GB = {halfed_bytes / 1024 ** 3:.2f} GB!")
+        else:
+            print(f"halfed {halfed_cnt} keys, {halfed_bytes} bytes, {halfed_bytes / 1024 ** 3:.2f} GB!")
 
     return (halfed_cnt, diff_bytes, total_bytes)
 
@@ -291,6 +292,26 @@ def statedict_strip_ema(sd: dict, print_stats: bool = False, verbose: bool = Fal
             print(f"stripped {len(stripped)} ema model keys from state_dict: {sorted(stripped.keys())}")
         else:
             print(f"stripped {len(stripped)} ema model keys from state_dict")
+
+    return sd, stripped
+
+
+def statedict_prune_sd(sd: dict, allowed_keys, print_stats: bool = False, verbose: bool = False):
+    allowed_keys = set(allowed_keys)
+
+    stripped = { }
+    for key, val in sd.items():
+        if key not in allowed_keys:
+            stripped[key] = val
+
+    for key in stripped:
+        del sd[key]
+
+    if print_stats:
+        if verbose:
+            print(f"pruned {len(stripped)} model keys from state_dict, {len(sd)} remaining. pruned : {sorted(stripped.keys())}")
+        else:
+            print(f"pruned {len(stripped)} model keys from state_dict, {len(sd)} remaining")
 
     return sd, stripped
 
@@ -504,10 +525,11 @@ def pickle_bytes_safe_load_dict(
 
 
 DTYPE_MAP = {
-    "torch FloatStorage": (torch.float32, 4),
-    "torch HalfStorage":  (torch.float16, 2),
-    "torch IntStorage":   (torch.int32, 4),
-    "torch LongStorage":  (torch.int64, 8),
+    "torch FloatStorage":  (torch.float32, 4),
+    "torch HalfStorage":   (torch.float16, 2),
+    "torch IntStorage":    (torch.int32, 4),
+    "torch LongStorage":   (torch.int64, 8),
+    "torch DoubleStorage": (torch.double, 8),
 }
 
 
@@ -589,7 +611,9 @@ def _guess_filetype(path: str, default):
 def main(input_path: str, output_path: str, overwrite: bool, half: bool, extended: bool,
          ema_rename_require: bool, ema_rename_optional, ema_strip: bool, tensors_only: bool,
          set_times: bool, use_tmpfile: bool, fixed_write_filetype: str, full_model: bool,
-         keep_metadata: bool, lazy_load: bool, lazy_write: bool):
+         keep_metadata: bool, lazy_load: bool, lazy_write: bool, prune: bool):
+    torch.set_grad_enabled(False)
+
     if not os.path.exists(input_path):
         raise ValueError("input path not found", input_path)
 
@@ -650,6 +674,9 @@ def main(input_path: str, output_path: str, overwrite: bool, half: bool, extende
     if ema_strip:
         print("stripping ema model keys")
         statedict_strip_ema(sd, True)
+
+    if prune:
+        statedict_prune_sd(sd, SD_15_KEYS, print_stats = True)
 
     half_lazyily_while_writing = (lazy_write and is_lazy_ckpt)
     if half and not half_lazyily_while_writing:
@@ -741,6 +768,7 @@ if __name__ == "__main__":
         parser.add_argument("-H", "--half", action = "store_true")
         parser.add_argument("-F", "--full-model", action = "store_true", help = "use full loaded model not just statedict")
         parser.add_argument("-l", "--lazy", action = "store_true")
+        parser.add_argument("-p", "--prune", action = "store_true")
 
         format_group = parser.add_mutually_exclusive_group()
         format_group.add_argument("-C", "--write-ckpt", action = "store_true")
@@ -767,7 +795,7 @@ if __name__ == "__main__":
 
         main(args.input_file, args.output_file, args.overwrite, args.half, not args.simple, args.ema_rename, args.ema_rename_try, args.ema_strip,
              args.tensors_only, args.times, not args.no_tempfile, fixed_write_filetype, args.full_model, not args.no_metadata,
-             args.lazy, args.lazy)
+             args.lazy, args.lazy, args.prune)
 
 
     setup()
