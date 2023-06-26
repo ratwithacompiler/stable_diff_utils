@@ -47,8 +47,6 @@ def tensor_serialize_torch(tens: torch.Tensor) -> bytes:
 def tensor_deserialize_torch(tensor_data: bytes, map_location = None) -> torch.Tensor:
     buf = io.BytesIO(tensor_data)
     tensor = torch.load(buf, map_location = map_location)
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError("expected Tensor", tensor)
     return tensor
 
 
@@ -87,12 +85,14 @@ class TensorCache():
             tensor_key_fn: Callable[[torch.Tensor], str] = tensor_hash_key_torch_pickle,
             tensor_serialize_fn: Callable[[torch.Tensor], bytes] = tensor_serialize_torch,
             tensor_deserialize_fn: Callable[[bytes], torch.Tensor] = tensor_deserialize_torch,
+            strict: bool = True,
     ):
         self.tensor_key_fn = tensor_key_fn
         self.tensor_serialize_fn = tensor_serialize_fn
         self.tensor_deserialize_fn = tensor_deserialize_fn
 
         self.cache = SqliteKeyValueStore(path)
+        self.strict = strict
 
     def get(self, category: Optional[str], key: Union[str, torch.Tensor]) -> Optional[torch.Tensor]:
         if isinstance(key, torch.Tensor):
@@ -105,15 +105,19 @@ class TensorCache():
         if value is None:
             return None
 
-        return self.tensor_deserialize_fn(value)
+        tensor = self.tensor_deserialize_fn(value)
+        if self.strict and not isinstance(tensor, torch.Tensor):
+            raise TypeError("invalid tensor, expected Tensor", tensor)
+        return tensor
 
     def set(self, category: Optional[str], key: Union[str, torch.Tensor], tensor: torch.Tensor):
         if isinstance(key, torch.Tensor):
             key = self.tensor_key_fn(key)
+
         if not isinstance(key, str):
             raise TypeError("invalid key, expected str", key)
 
-        if not isinstance(tensor, torch.Tensor):
+        if self.strict and not isinstance(tensor, torch.Tensor):
             raise TypeError("invalid tensor, expected Tensor", tensor)
 
         tensor_bytes = self.tensor_serialize_fn(tensor)
@@ -128,7 +132,7 @@ class TensorCache():
             return tensor
 
         tensor = creation_fn()
-        if not isinstance(tensor, torch.Tensor):
+        if self.strict and not isinstance(tensor, torch.Tensor):
             raise TypeError("invalid tensor, expected Tensor", tensor)
 
         self.set(category, key, tensor)
