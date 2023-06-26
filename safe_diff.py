@@ -142,7 +142,7 @@ def main(
         use_unsafe_torch_load: bool,
         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
         suggested_filetype: Optional[str],
-        unique_keys: bool, data_comp: bool,
+        unique_keys: bool, data_comp: bool, full_model: bool,
 ):
     for i in (path1, path2):
         if not os.path.exists(i):
@@ -166,8 +166,13 @@ def main(
         models.append(model)
         del model
 
+    new_models = []
     for mod in models:
-        sd = mod["state_dict"]
+        if full_model:
+            sd = mod
+        else:
+            sd = mod["state_dict"]
+        new_models.append(sd)
 
         if ema_rename_require:
             print("replacing model keys with required ema model keys")
@@ -181,8 +186,6 @@ def main(
             statedict_strip_ema(sd, True)
         del sd
 
-    model1, model2 = models
-
     # sum_cnt = 0
     # sums = torch.zeros(1024 * 64, dtype = torch.float64)
     sums = []
@@ -195,8 +198,7 @@ def main(
         sums.append(sum.item())
         pass
 
-    sd1 = model1["state_dict"]
-    sd2 = model2["state_dict"]
+    sd1, sd2 = new_models
 
     if unique_keys:
         only_in_1 = sd1.keys() - sd2.keys()
@@ -243,8 +245,8 @@ if __name__ == "__main__":
                             help = "if ema keys present replace normal model keys with ema equivalent, ema keys not kept separately")
         parser.add_argument("--ema-rename", action = "store_true",
                             help = "replace normal model keys with ema equivalent, ema keys not kept separately, require ema keys")
-        parser.add_argument("-E", "--ema-strip", action = "store_true",
-                            help = "strip ema model keys")
+        parser.add_argument("-E", "--ema-strip", action = "store_true", help = "strip ema model keys")
+        parser.add_argument("-F", "--full-model", action = "store_true", help = "use full loaded model not just statedict")
 
         format_group = parser.add_mutually_exclusive_group()
         format_group.add_argument("-C", "--load-ckpt", action = "store_true", help = "assume ckpt file for unknown extensions")
@@ -265,6 +267,7 @@ if __name__ == "__main__":
             args.ckpt_1, args.ckpt_2, args.use_unsafe_torch_load,
             args.ema_rename, args.ema_rename_try, args.ema_strip,
             suggested_filetype, args.unique_keys, not args.no_data_comp,
+            args.full_model,
         )
 
 
