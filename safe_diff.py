@@ -147,7 +147,7 @@ def main(
         only_prefixes: list[str] | None,
 ):
     only_prefixes = tuple(only_prefixes) if only_prefixes else None
-    
+
     for i in (path1, path2):
         if not os.path.exists(i):
             raise FileNotFoundError(i)
@@ -204,14 +204,23 @@ def main(
     # sum_cnt = 0
     # sums = torch.zeros(1024 * 64, dtype = torch.float64)
     sums = []
+    n_same = 0
+    n_allclose = 0
 
     def tens_diff(key: str, t1: torch.Tensor, t2: torch.Tensor):
+        nonlocal n_same, n_allclose
+
         diff = torch.subtract(t1, t2)
         sum = torch.sum(diff, dtype = torch.float64)
         # print(key, "sum", sum.item())
         # print(key, "diff", diff)
         sums.append(sum.item())
-        pass
+
+        if torch.equal(t1, t2):
+            n_same += 1
+
+        if torch.allclose(t1, t2):
+            n_allclose += 1
 
     sd1, sd2 = new_models
 
@@ -244,6 +253,8 @@ def main(
     print("diff sum: ", total)
     print("std dev : ", std.item())
     print("mean    : ", mean.item())
+    print("same    : ", n_same)
+    print("allclose: ", n_allclose)
 
     print("abs sum     : ", total_abs)
     print("abs std dev : ", std_abs.item())
