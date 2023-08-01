@@ -26,6 +26,7 @@ Calculate total sum of difference between two checkpoints,
 useful for making a good guess on which weights something was finetuned/dreamboothed on
 by comparing abs sum and abs mean.
 """
+from __future__ import annotations
 
 import argparse
 import builtins
@@ -143,7 +144,10 @@ def main(
         ema_rename_require: bool, ema_rename_optional, ema_strip: bool,
         suggested_filetype: Optional[str],
         unique_keys: bool, data_comp: bool, full_model: bool,
+        only_prefixes: list[str] | None,
 ):
+    only_prefixes = tuple(only_prefixes) if only_prefixes else None
+    
     for i in (path1, path2):
         if not os.path.exists(i):
             raise FileNotFoundError(i)
@@ -184,6 +188,17 @@ def main(
         if ema_strip:
             print("stripping ema model keys")
             statedict_strip_ema(sd, True)
+
+        if only_prefixes:
+            dropped = 0
+            for key in list(sd.keys()):
+                if not key.startswith(only_prefixes):
+                    sd.pop(key)
+                    dropped += 1
+
+            if dropped:
+                print(f"dropped {dropped} keys not starting with {sorted(only_prefixes)}")
+
         del sd
 
     # sum_cnt = 0
@@ -251,6 +266,7 @@ if __name__ == "__main__":
         format_group = parser.add_mutually_exclusive_group()
         format_group.add_argument("-C", "--load-ckpt", action = "store_true", help = "assume ckpt file for unknown extensions")
         format_group.add_argument("-S", "--load-safetensors", action = "store_true", help = "assume safetensor file for unknown extensions")
+        format_group.add_argument("-P", "--prefix", action = "append")
 
         parser.add_argument("ckpt_1")
         parser.add_argument("ckpt_2")
@@ -267,7 +283,7 @@ if __name__ == "__main__":
             args.ckpt_1, args.ckpt_2, args.use_unsafe_torch_load,
             args.ema_rename, args.ema_rename_try, args.ema_strip,
             suggested_filetype, args.unique_keys, not args.no_data_comp,
-            args.full_model,
+            args.full_model, args.prefix,
         )
 
 
